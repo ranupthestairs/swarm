@@ -12,6 +12,7 @@ from swarm.core.fly_trajectory import (
     format_score_summary,
     frame_obs_info,
     list_saved_runs,
+    load_latest_trajectory,
     load_trajectory,
     run_video_filename,
     save_trajectory,
@@ -135,6 +136,45 @@ def test_format_score_summary() -> None:
         {"score": 0.89, "success_term": 1.0, "time_term": 0.82, "safety_term": 0.55}
     )
     assert summary == "0.89  S:1.00  T:0.82  Saf:0.55"
+
+
+def test_list_saved_runs_skips_corrupt_trajectory(tmp_path: Path) -> None:
+    import gzip
+    import os
+
+    frame = FlyTrajectoryFrame(
+        t_sim=0.02,
+        frame=1,
+        position=np.array([1.0, 2.0, 3.0]),
+        quaternion=np.array([0.0, 0.0, 0.0, 1.0]),
+        velocity=np.array([0.1, 0.2, 0.0]),
+        action=np.array([0.0, 0.0, 1.0, 0.5, 0.0]),
+    )
+    good = FlyTrajectory(
+        meta={
+            "agent_name": "agent",
+            "seed": 1,
+            "challenge_type": 1,
+            "type_label": "city",
+            "agent_path": "/tmp/agent",
+            "agent_kind": "source",
+            "result": {"success": True, "score": 0.5},
+        },
+        frames=[frame],
+    )
+    good_path = save_trajectory(good, repo_root=tmp_path)
+
+    bad = fly_runs_dir(tmp_path) / "agent_seed2_city_20260701_120100.flytraj.json.gz"
+    with gzip.open(bad, "wb") as handle:
+        handle.write(b"not-json")
+    os.utime(bad, (bad.stat().st_mtime + 10, bad.stat().st_mtime + 10))
+
+    runs = list_saved_runs(tmp_path)
+    assert len(runs) == 2
+    assert load_latest_trajectory(tmp_path) is not None
+    assert load_latest_trajectory(tmp_path).meta["seed"] == 1
+    assert _peek_trajectory_result(bad) is None
+    assert good_path.is_file()
 
 
 def test_browse_run_file_zenity_list_builds_args(tmp_path: Path) -> None:

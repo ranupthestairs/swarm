@@ -315,7 +315,7 @@ def _peek_trajectory_result(path: Path, *, head_bytes: int = 65536) -> dict[str,
     try:
         with gzip.open(path, "rt", encoding="utf-8") as handle:
             chunk = handle.read(head_bytes)
-    except OSError:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     key = '"result"'
     idx = chunk.find(key)
@@ -458,18 +458,21 @@ def save_trajectory(
 
 def load_trajectory(path: Path) -> FlyTrajectory:
     path = Path(path).expanduser()
-    with gzip.open(path, "rt", encoding="utf-8") as handle:
-        data = json.load(handle)
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid or corrupt trajectory file: {path}") from exc
     trajectory = FlyTrajectory.from_dict(data)
     trajectory.meta.setdefault("path", str(path.resolve()))
     return trajectory
 
 
 def load_latest_trajectory(repo_root: Path | None = None) -> FlyTrajectory | None:
-    for run in list_saved_runs(repo_root, limit=1):
+    for run in list_saved_runs(repo_root, limit=50):
         try:
             return load_trajectory(run.path)
-        except (OSError, json.JSONDecodeError, ValueError):
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
             continue
     return None
 

@@ -32,6 +32,15 @@ DEFAULT_VIEW_WIDTH = 960
 DEFAULT_VIEW_HEIGHT = 540
 VIDEO_FPS = 25
 
+# Match scripts/generate_video.py chase/fpv tuning for stable live preview.
+CHASE_DISTANCE_BACK_M = 2.5
+CHASE_HEIGHT_ABOVE_M = 1.0
+CHASE_SMOOTHING = 0.92
+FPV_OFFSET_FORWARD_M = 0.15
+FPV_OFFSET_UP_M = 0.02
+FPV_SMOOTHING = 0.85
+OVERVIEW_ORBIT_DEG_SEC = 5.0
+
 
 def compute_left_panel_min_height() -> int:
     """Minimum left-panel height so every control row is clickable."""
@@ -341,6 +350,33 @@ class FlyRenderCamera:
         self.mode = mode
         self.distance_scale = 1.0
         self._overview_yaw_deg = 0.0
+        self._smooth_fwd: np.ndarray | None = None
+        self._smooth_up: np.ndarray | None = None
+        self._smoothing_mode = mode
+
+    def reset_smoothing(self) -> None:
+        self._smooth_fwd = None
+        self._smooth_up = None
+
+    def _sync_smoothing_mode(self) -> None:
+        if self.mode != self._smoothing_mode:
+            self.reset_smoothing()
+            self._smoothing_mode = self.mode
+
+    @staticmethod
+    def _smooth_vector(
+        current: np.ndarray,
+        previous: np.ndarray | None,
+        alpha: float,
+    ) -> np.ndarray:
+        if previous is None:
+            smoothed = current
+        else:
+            smoothed = alpha * previous + (1.0 - alpha) * current
+        norm = float(np.linalg.norm(smoothed))
+        if norm < 1e-9:
+            return current
+        return smoothed / norm
 
     def eye_and_target(
         self,
@@ -348,25 +384,38 @@ class FlyRenderCamera:
         quat: Sequence[float],
         dt: float,
     ) -> tuple[np.ndarray, np.ndarray]:
+        self._sync_smoothing_mode()
         forward, _, up = _drone_basis(quat)
+        pos = np.asarray(position, dtype=float)
 
         if self.mode == "chase":
-            back = 2.8 * self.distance_scale
-            eye = position - forward * back + up * (0.35 * self.distance_scale)
-            target = position + np.array([0.0, 0.0, 0.35])
+            fwd = self._smooth_vector(forward, self._smooth_fwd, CHASE_SMOOTHING)
+            self._smooth_fwd = fwd
+            back = CHASE_DISTANCE_BACK_M * self.distance_scale
+            height = CHASE_HEIGHT_ABOVE_M * self.distance_scale
+            eye = pos - fwd * back + np.array([0.0, 0.0, height])
+            target = pos + np.array([0.0, 0.0, 0.15])
         elif self.mode == "fpv":
-            eye = position + forward * (0.15 * self.distance_scale) + up * 0.05
-            target = eye + forward * 20.0
+            fwd = self._smooth_vector(forward, self._smooth_fwd, FPV_SMOOTHING)
+            body_up = self._smooth_vector(up, self._smooth_up, FPV_SMOOTHING)
+            self._smooth_fwd = fwd
+            self._smooth_up = body_up
+            offset_fwd = FPV_OFFSET_FORWARD_M * self.distance_scale
+            offset_up = FPV_OFFSET_UP_M * self.distance_scale
+            eye = pos + fwd * offset_fwd + body_up * offset_up
+            target = eye + fwd * 20.0
         elif self.mode == "top":
-            eye = position + np.array([0.0, 0.0, 20.0 * self.distance_scale])
-            target = position
+            eye = pos + np.array([0.0, 0.0, 20.0 * self.distance_scale])
+            target = pos
         else:
-            midpoint = (position + self.goal) * 0.5
-            span = float(np.linalg.norm(position - self.goal))
-            self._overview_yaw_deg = (self._overview_yaw_deg + 35.0 * dt) % 360.0
+            midpoint = (pos + self.goal) * 0.5
+            span = float(np.linalg.norm(pos - self.goal))
+            self._overview_yaw_deg = (
+                self._overview_yaw_deg + OVERVIEW_ORBIT_DEG_SEC * dt
+            ) % 360.0
             yaw_r = math.radians(self._overview_yaw_deg)
-            pitch_r = math.radians(-38.0)
-            dist = max(16.0, span * 1.25) * self.distance_scale
+            pitch_r = math.radians(-35.0)
+            dist = max(15.0, span * 1.3) * self.distance_scale
             eye = np.array(
                 [
                     midpoint[0] + dist * math.cos(yaw_r) * math.cos(pitch_r),

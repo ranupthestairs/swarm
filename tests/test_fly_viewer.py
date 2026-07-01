@@ -125,3 +125,33 @@ def test_parse_seed_text_clamps_and_fallback() -> None:
     assert parse_seed_text("0", fallback=42) == 1
     assert parse_seed_text("abc", fallback=42) == 42
     assert parse_seed_text("", fallback=7) == 7
+
+
+def test_chase_camera_smoothing_reduces_heading_jitter() -> None:
+    camera = FlyRenderCamera((10.0, 0.0, 2.0), mode="chase")
+    pos = np.array([0.0, 0.0, 1.0], dtype=float)
+    quat_a = (0.0, 0.0, 0.0, 1.0)
+    quat_b = (0.0, 0.0, 0.258819, 0.9659258)  # ~30 deg yaw
+
+    eye_a, _ = camera.eye_and_target(pos, quat_a, dt=0.02)
+    eye_b, _ = camera.eye_and_target(pos, quat_b, dt=0.02)
+
+    camera_raw = FlyRenderCamera((10.0, 0.0, 2.0), mode="chase")
+    raw_a, _ = camera_raw.eye_and_target(pos, quat_a, dt=0.02)
+    camera_raw.reset_smoothing()
+    raw_b, _ = camera_raw.eye_and_target(pos, quat_b, dt=0.02)
+
+    smooth_delta = float(np.linalg.norm(eye_b - eye_a))
+    raw_delta = float(np.linalg.norm(raw_b - raw_a))
+    assert smooth_delta < raw_delta
+
+
+def test_camera_mode_switch_resets_smoothing() -> None:
+    camera = FlyRenderCamera((10.0, 0.0, 2.0), mode="chase")
+    pos = np.array([0.0, 0.0, 1.0], dtype=float)
+    camera.eye_and_target(pos, (0.0, 0.0, 0.258819, 0.9659258), dt=0.02)
+    assert camera._smooth_fwd is not None
+
+    camera.mode = "fpv"
+    camera.eye_and_target(pos, (0.0, 0.0, 0.0, 1.0), dt=0.02)
+    assert camera._smoothing_mode == "fpv"
