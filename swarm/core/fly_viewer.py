@@ -1,0 +1,1193 @@
+"""Pygame UI and off-screen cameras for ``swarm fly``."""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Sequence
+
+import numpy as np
+
+from swarm.core.fly_setup import (
+    MAP_TYPE_CHOICES,
+    FlyLaunchConfig,
+    load_last_agent_path,
+    resolve_agent_path,
+    save_last_agent_path,
+)
+from swarm.core.fly_trajectory import (
+    SavedRunInfo,
+    browse_run_file,
+    list_saved_runs,
+)
+
+CAMERA_MODES: tuple[str, ...] = ("chase", "fpv", "top", "overview")
+PANEL_WIDTH = 320
+BOTTOM_PANEL_HEIGHT = 228
+LEFT_PANEL_BOTTOM_PADDING = 24
+REPLAY_SPEED_CHOICES: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
+DEFAULT_VIEW_WIDTH = 960
+DEFAULT_VIEW_HEIGHT = 540
+VIDEO_FPS = 25
+
+
+def compute_left_panel_min_height() -> int:
+    """Minimum left-panel height so every control row is clickable."""
+    btn_h = 26
+    gap = 6
+    y_cam = 586
+    zoom_row_bottom = y_cam + 2 * (btn_h + gap) + btn_h
+    return zoom_row_bottom + LEFT_PANEL_BOTTOM_PADDING
+
+
+LEFT_PANEL_MIN_HEIGHT = compute_left_panel_min_height()
+
+
+def _fmt_vec(values: Any, precision: int = 2) -> str:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    if arr.size < 3:
+        return "(?, ?, ?)"
+    return (
+        f"({arr[0]:.{precision}f}, {arr[1]:.{precision}f}, {arr[2]:.{precision}f})"
+    )
+
+
+def _fmt_bool(value: Any) -> str:
+    if value is None:
+        return "?"
+    return "yes" if bool(value) else "no"
+
+
+def _goal_detection_lines(
+    agent_info: dict[str, Any],
+    *,
+    obs_info: dict[str, Any] | None = None,
+    task: Any | None = None,
+) -> list[str]:
+    """Build goal-detection rows for the bottom telemetry panel."""
+    lines: list[str] = []
+    prob = agent_info.get("goal_visibility_prob")
+    prob_txt = "-" if prob is None else f"{float(prob):.2f}"
+
+    status_parts = [
+        f"locked={_fmt_bool(agent_info.get('goal_detected'))}",
+        f"visible={_fmt_bool(agent_info.get('goal_visible'))}",
+        f"tracked={_fmt_bool(agent_info.get('goal_tracked'))}",
+        f"prob={prob_txt}",
+    ]
+    lost = agent_info.get("platform_lost_steps")
+    if lost is not None:
+        status_parts.append(f"lost={int(lost)}")
+    dist_buf = agent_info.get("goal_distance_buffer")
+    if dist_buf is not None:
+        status_parts.append(f"dist_buf={float(dist_buf):.2f}")
+    lines.append("Goal detect  " + "  ".join(status_parts))
+
+    predicted = agent_info.get("predicted_goal_position")
+    if predicted is None:
+        lines.append(
+            "Predict pad  (none) — agent has not estimated the landing platform yet"
+        )
+        return lines
+
+    pred = np.asarray(predicted, dtype=float).reshape(3)
+    detail_parts = [f"Predict pad {_fmt_vec(pred)}"]
+    if obs_info is not None:
+        pos = np.asarray(obs_info["position"], dtype=float).reshape(3)
+        detail_parts.append(f"dist={float(np.linalg.norm(pred - pos)):.1f}m")
+        search_center = obs_info.get("search_area_center")
+        if search_center is not None:
+            center = np.asarray(search_center, dtype=float).reshape(3)
+            detail_parts.append(f"err_GPS_hint={float(np.linalg.norm(pred - center)):.1f}m")
+    if task is not None and getattr(task, "goal", None) is not None:
+        true_goal = np.asarray(task.goal, dtype=float).reshape(3)
+        detail_parts.append(f"err_true_pad={float(np.linalg.norm(pred - true_goal)):.1f}m")
+    lines.append("  ".join(detail_parts))
+    return lines
+
+
+def build_bottom_telemetry_lines(
+    *,
+    task: Any | None,
+    sim_state: str,
+    t_sim: float,
+    frame: int,
+    obs_info: dict[str, Any] | None,
+    agent_info: dict[str, Any] | None,
+    action: np.ndarray | None,
+    camera_mode: str,
+    result: dict[str, Any] | None = None,
+) -> list[str]:
+    lines = [
+        (
+            f"Time {t_sim:6.2f}s   Frame {frame:5d}   "
+            f"Status {sim_state.upper():9s}   Camera {camera_mode}"
+        ),
+    ]
+    if task is not None:
+        lines.append(
+            f"Mission  start {_fmt_vec(task.start)}   goal {_fmt_vec(task.goal)}   "
+            f"radius {float(task.search_radius):.1f}m"
+        )
+    if obs_info is not None:
+        lines.append(
+            f"Position {_fmt_vec(obs_info['position'])}   "
+            f"Speed {float(obs_info['speed_mps']):.2f} m/s   "
+            f"Search {_fmt_vec(obs_info['search_area_vector'])}   "
+            f"Center {_fmt_vec(obs_info['search_area_center'])}"
+        )
+    if agent_info is not None:
+        map_pred = agent_info.get("map_prediction")
+        lines.append(
+            f"Mode {agent_info.get('mode') or '-':12s}   "
+            f"map={map_pred if map_pred is not None else '-'}"
+        )
+        lines.extend(
+            _goal_detection_lines(agent_info, obs_info=obs_info, task=task)
+        )
+    if action is not None:
+        act = np.asarray(action, dtype=float).reshape(-1)
+        if act.size >= 5:
+            lines.append(
+                "Action "
+                f"[dir_x={act[0]:+.2f}, dir_y={act[1]:+.2f}, dir_z={act[2]:+.2f}, "
+                f"speed={act[3]:.2f}, yaw={act[4]:+.2f}]"
+            )
+    if result is not None:
+        lines.append(
+            f"Result success={_fmt_bool(result.get('success'))}   "
+            f"time={float(result.get('time_sec', 0.0)):.2f}s   "
+            f"collision={_fmt_bool(result.get('collision'))}"
+        )
+        from swarm.core.fly_trajectory import format_score_detail_lines
+
+        lines.extend(format_score_detail_lines(result))
+    return lines
+
+
+def _resolve_browse_start_dir(initial_dir: str | Path | None) -> Path:
+    if initial_dir:
+        candidate = Path(initial_dir).expanduser()
+        if candidate.is_file():
+            candidate = candidate.parent
+        if candidate.is_dir():
+            return candidate.resolve()
+    return Path.cwd().resolve()
+
+
+def browse_agent_directory(
+    *,
+    initial_dir: str | Path | None = None,
+    on_before_dialog: Any | None = None,
+    on_after_dialog: Any | None = None,
+) -> str | None:
+    """Open a native folder picker for an agent source directory."""
+    import sys
+
+    start_dir = str(_resolve_browse_start_dir(initial_dir))
+    if on_before_dialog is not None:
+        on_before_dialog()
+    try:
+        if sys.platform.startswith("linux"):
+            picked = _browse_agent_directory_zenity(start_dir)
+            if picked:
+                return picked
+            picked = _browse_agent_directory_kdialog(start_dir)
+            if picked:
+                return picked
+        picked = _browse_agent_directory_tk(start_dir)
+        if picked:
+            return picked
+        if not sys.platform.startswith("linux"):
+            picked = _browse_agent_directory_zenity(start_dir)
+            if picked:
+                return picked
+            return _browse_agent_directory_kdialog(start_dir)
+        return None
+    finally:
+        if on_after_dialog is not None:
+            on_after_dialog()
+
+
+def _browse_agent_directory_tk(start_dir: str) -> str | None:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except ImportError:
+        return None
+
+    root = tk.Tk()
+    root.withdraw()
+    root.update_idletasks()
+    root.update()
+    try:
+        root.attributes("-topmost", True)
+        root.lift()
+        root.focus_force()
+    except tk.TclError:
+        pass
+
+    picked = filedialog.askdirectory(
+        title="Select agent source folder",
+        initialdir=start_dir,
+        parent=root,
+        mustexist=True,
+    )
+    root.update()
+    root.destroy()
+    return picked or None
+
+
+def _browse_agent_directory_zenity(start_dir: str) -> str | None:
+    import shutil
+    import subprocess
+
+    if not shutil.which("zenity"):
+        return None
+    start_path = Path(start_dir)
+    if not start_path.is_dir():
+        start_path = Path.cwd()
+    try:
+        result = subprocess.run(
+            [
+                "zenity",
+                "--file-selection",
+                "--directory",
+                "--title=Select agent source folder",
+                f"--filename={start_path.resolve()}/",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode == 0:
+        picked = result.stdout.strip()
+        return picked or None
+    return None
+
+
+def _browse_agent_directory_kdialog(start_dir: str) -> str | None:
+    import shutil
+    import subprocess
+
+    if not shutil.which("kdialog"):
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "kdialog",
+                "--getexistingdirectory",
+                start_dir,
+                "--title",
+                "Select agent source folder",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode == 0:
+        picked = result.stdout.strip()
+        return picked or None
+    return None
+
+
+def _native_picker_available() -> bool:
+    import shutil
+
+    try:
+        import tkinter  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        return True
+    return bool(shutil.which("zenity") or shutil.which("kdialog"))
+
+
+def parse_seed_text(text: str, *, fallback: int = 42) -> int:
+    cleaned = text.strip()
+    if not cleaned:
+        return max(1, int(fallback))
+    try:
+        return max(1, int(cleaned))
+    except ValueError:
+        return max(1, int(fallback))
+
+
+def _drone_basis(quat: Sequence[float]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    import pybullet as p
+
+    rot = np.array(p.getMatrixFromQuaternion(quat), dtype=float).reshape(3, 3)
+    forward = rot @ np.array([1.0, 0.0, 0.0], dtype=float)
+    right = rot @ np.array([0.0, 1.0, 0.0], dtype=float)
+    up = rot @ np.array([0.0, 0.0, 1.0], dtype=float)
+    forward /= max(float(np.linalg.norm(forward)), 1e-9)
+    up /= max(float(np.linalg.norm(up)), 1e-9)
+    return forward, right, up
+
+
+class FlyRenderCamera:
+    """Off-screen camera used by the pygame viewport."""
+
+    def __init__(self, goal: Sequence[float], *, mode: str = "chase") -> None:
+        if mode not in CAMERA_MODES:
+            raise ValueError(f"Unsupported camera mode: {mode}")
+        self.goal = np.asarray(goal, dtype=float)
+        self.mode = mode
+        self.distance_scale = 1.0
+        self._overview_yaw_deg = 0.0
+
+    def eye_and_target(
+        self,
+        position: np.ndarray,
+        quat: Sequence[float],
+        dt: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        forward, _, up = _drone_basis(quat)
+
+        if self.mode == "chase":
+            back = 2.8 * self.distance_scale
+            eye = position - forward * back + up * (0.35 * self.distance_scale)
+            target = position + np.array([0.0, 0.0, 0.35])
+        elif self.mode == "fpv":
+            eye = position + forward * (0.15 * self.distance_scale) + up * 0.05
+            target = eye + forward * 20.0
+        elif self.mode == "top":
+            eye = position + np.array([0.0, 0.0, 20.0 * self.distance_scale])
+            target = position
+        else:
+            midpoint = (position + self.goal) * 0.5
+            span = float(np.linalg.norm(position - self.goal))
+            self._overview_yaw_deg = (self._overview_yaw_deg + 35.0 * dt) % 360.0
+            yaw_r = math.radians(self._overview_yaw_deg)
+            pitch_r = math.radians(-38.0)
+            dist = max(16.0, span * 1.25) * self.distance_scale
+            eye = np.array(
+                [
+                    midpoint[0] + dist * math.cos(yaw_r) * math.cos(pitch_r),
+                    midpoint[1] + dist * math.sin(yaw_r) * math.cos(pitch_r),
+                    midpoint[2] - dist * math.sin(pitch_r),
+                ],
+                dtype=float,
+            )
+            target = midpoint
+        return eye.astype(float), target.astype(float)
+
+
+def render_rgb_frame(
+    cli: int,
+    *,
+    eye: Sequence[float],
+    target: Sequence[float],
+    width: int,
+    height: int,
+    fov: float = 65.0,
+    far: float = 250.0,
+) -> np.ndarray:
+    import pybullet as p
+
+    view = p.computeViewMatrix(
+        cameraEyePosition=list(eye),
+        cameraTargetPosition=list(target),
+        cameraUpVector=[0.0, 0.0, 1.0],
+        physicsClientId=cli,
+    )
+    projection = p.computeProjectionMatrixFOV(
+        fov=float(fov),
+        aspect=width / max(height, 1),
+        nearVal=0.05,
+        farVal=float(far),
+        physicsClientId=cli,
+    )
+    flags = int(getattr(p, "ER_NO_SEGMENTATION_MASK", 0))
+    _, _, rgba, _, _ = p.getCameraImage(
+        width=int(width),
+        height=int(height),
+        viewMatrix=view,
+        projectionMatrix=projection,
+        renderer=p.ER_TINY_RENDERER,
+        shadow=0,
+        lightDirection=[0.4, 0.4, 1.0],
+        flags=flags,
+        physicsClientId=cli,
+    )
+    return np.asarray(rgba, dtype=np.uint8).reshape(height, width, 4)[:, :, :3]
+
+
+def export_video(frames: list[np.ndarray], output_path: Path, fps: int = VIDEO_FPS) -> Path:
+    if not frames:
+        raise ValueError("No frames recorded; run the simulation before exporting.")
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    height, width = frames[0].shape[:2]
+    from scripts.generate_video import _open_video_writer
+
+    writer = _open_video_writer(output_path, fps=fps, width=width, height=height)
+    try:
+        for frame in frames:
+            writer.append_data(np.asarray(frame, dtype=np.uint8))
+    finally:
+        writer.close()
+    return output_path
+
+
+@dataclass
+class FlyUiEvent:
+    quit: bool = False
+    build_map: bool = False
+    start: bool = False
+    pause: bool = False
+    replay: bool = False
+    open_run: bool = False
+    load_run_path: str | None = None
+    export: bool = False
+    replay_seek: int | None = None
+    replay_speed: float | None = None
+    camera_mode: str | None = None
+    zoom_in: bool = False
+    zoom_out: bool = False
+
+
+@dataclass
+class ReplayUiState:
+    active: bool
+    frame: int
+    total_frames: int
+    t_sim: float
+    duration: float
+    speed: float
+
+
+@dataclass(frozen=True)
+class _Button:
+    key: str
+    label: str
+    rect: tuple[int, int, int, int]
+
+
+class FlySimulatorWindow:
+    """Single-window fly UI: left config, 3D view, bottom telemetry."""
+
+    def __init__(
+        self,
+        *,
+        title: str,
+        view_width: int = DEFAULT_VIEW_WIDTH,
+        view_height: int = DEFAULT_VIEW_HEIGHT,
+        camera_mode: str = "chase",
+        seed: int = 42,
+        challenge_type: int = 1,
+        last_agent_path: str | Path | None = None,
+        custom_path: str = "",
+        use_last_agent: bool = True,
+        repo_root: Path | None = None,
+    ) -> None:
+        import pygame
+
+        self._pygame = pygame
+        self.view_width = int(view_width)
+        self.view_height = int(view_height)
+        self.camera_mode = camera_mode
+        self.seed = int(seed)
+        self.challenge_type = int(challenge_type)
+        self.custom_path = custom_path
+        self.custom_active = False
+        self.seed_active = False
+        self.seed_text = str(int(seed))
+        self.quit_requested = False
+        self.map_loaded = False
+        self._status_message = "Select agent, seed, and map type. Then Build Map."
+        self._export_enabled = False
+        self._replay_enabled = False
+        self._sim_state = "config"
+        self._camera_label_y = 562
+        self._simulation_label_y = 424
+        self.repo_root = repo_root
+        self.saved_runs: list[SavedRunInfo] = []
+        self.run_scroll = 0
+        self.selected_run_path: str | None = None
+        self.replay_speed = 1.0
+        self._replay_ui_active = False
+        self._timeline_dragging = False
+        self._buttons: list[_Button] = []
+        self.left_panel_height = max(self.view_height, LEFT_PANEL_MIN_HEIGHT)
+
+        loaded_last = load_last_agent_path() if last_agent_path is None else None
+        if last_agent_path is not None:
+            candidate = Path(str(last_agent_path)).expanduser()
+            self.last_agent_path = (
+                str(candidate.resolve())
+                if resolve_agent_path(candidate) is not None
+                else None
+            )
+        elif loaded_last is not None:
+            self.last_agent_path = str(loaded_last)
+        else:
+            self.last_agent_path = None
+
+        if self.custom_path.strip():
+            self.use_last_agent = False
+        elif use_last_agent and self.last_agent_path:
+            self.use_last_agent = True
+        else:
+            self.use_last_agent = False
+
+        pygame.init()
+        pygame.display.set_caption(title)
+        self.screen = pygame.display.set_mode(
+            (
+                PANEL_WIDTH + self.view_width,
+                self.left_panel_height + BOTTOM_PANEL_HEIGHT,
+            ),
+            pygame.RESIZABLE,
+        )
+        self._font = pygame.font.SysFont("dejavusans", 14)
+        self._font_small = pygame.font.SysFont("dejavusans", 12)
+        self._font_title = pygame.font.SysFont("dejavusans", 16, bold=True)
+        self.refresh_saved_runs()
+        self._layout_buttons()
+
+    def refresh_saved_runs(self) -> None:
+        self.saved_runs = list_saved_runs(self.repo_root, limit=50)
+        self.run_scroll = max(
+            0,
+            min(self.run_scroll, max(0, len(self.saved_runs) - 3)),
+        )
+
+    def set_replay_ui_active(self, active: bool) -> None:
+        self._replay_ui_active = bool(active)
+
+    def _layout_buttons(self) -> None:
+        x0 = 10
+        w_full = PANEL_WIDTH - 20
+        w_half = (w_full - 6) // 2
+        gap = 6
+        btn_h = 26
+        map_btn_h = 24
+
+        y_map = 222
+        y_build = 446
+        y_ctrl = 476
+        y_replay_row = 506
+        y_export = 536
+        y_cam = 586
+        self._camera_label_y = 562
+        self._runs_label_y = 310
+        self._run_rows_top = 328
+        self._simulation_label_y = 424
+
+        self._buttons = [
+            _Button("open_dir", "Open Dir...", (x0, 128, 92, 28)),
+            _Button("build_map", "Build Map", (x0, y_build, w_full, btn_h)),
+            _Button("start", "Start", (x0, y_ctrl, w_half, btn_h)),
+            _Button("pause", "Pause", (x0 + w_half + gap, y_ctrl, w_half, btn_h)),
+            _Button("replay", "Replay", (x0, y_replay_row, w_half, btn_h)),
+            _Button("open_run", "Open Run", (x0 + w_half + gap, y_replay_row, w_half, btn_h)),
+            _Button("export", "Export", (x0, y_export, w_full, btn_h)),
+            _Button("cam_chase", "Chase", (x0, y_cam, w_half, btn_h)),
+            _Button("cam_fpv", "FPV", (x0 + w_half + gap, y_cam, w_half, btn_h)),
+            _Button("cam_top", "Top", (x0, y_cam + btn_h + gap, w_half, btn_h)),
+            _Button(
+                "cam_overview",
+                "Overview",
+                (x0 + w_half + gap, y_cam + btn_h + gap, w_half, btn_h),
+            ),
+            _Button(
+                "zoom_in",
+                "Zoom +",
+                (x0, y_cam + 2 * (btn_h + gap), w_half, btn_h),
+            ),
+            _Button(
+                "zoom_out",
+                "Zoom -",
+                (x0 + w_half + gap, y_cam + 2 * (btn_h + gap), w_half, btn_h),
+            ),
+        ]
+        for idx, (challenge_type, label) in enumerate(MAP_TYPE_CHOICES):
+            row, col = divmod(idx, 2)
+            self._buttons.append(
+                _Button(
+                    f"type_{challenge_type}",
+                    label,
+                    (
+                        x0 + col * (w_half + gap),
+                        y_map + row * (map_btn_h + 4),
+                        w_half,
+                        map_btn_h,
+                    ),
+                )
+            )
+
+    def set_status(self, message: str) -> None:
+        self._status_message = message
+
+    def set_export_enabled(self, enabled: bool) -> None:
+        self._export_enabled = bool(enabled)
+
+    def set_replay_enabled(self, enabled: bool) -> None:
+        self._replay_enabled = bool(enabled)
+
+    def set_map_loaded(self, loaded: bool) -> None:
+        self.map_loaded = bool(loaded)
+
+    def set_sim_state(self, state: str) -> None:
+        self._sim_state = str(state)
+
+    def _last_agent_row_rect(self) -> tuple[int, int, int, int]:
+        return (10, 76, PANEL_WIDTH - 20, 28)
+
+    def _custom_field_rect(self) -> tuple[int, int, int, int]:
+        return (108, 128, PANEL_WIDTH - 118, 28)
+
+    def _seed_field_rect(self) -> tuple[int, int, int, int]:
+        return (56, 168, PANEL_WIDTH - 66, 26)
+
+    def _run_row_rect(self, row_index: int) -> tuple[int, int, int, int]:
+        return (10, self._run_rows_top + row_index * 30, PANEL_WIDTH - 20, 28)
+
+    def _replay_timeline_rect(self, bottom_y: int) -> tuple[int, int, int, int]:
+        width = PANEL_WIDTH + self.view_width - 24
+        return (12, bottom_y + 168, width, 16)
+
+    def _replay_speed_rect(self, bottom_y: int, speed: float) -> tuple[int, int, int, int]:
+        idx = REPLAY_SPEED_CHOICES.index(speed) if speed in REPLAY_SPEED_CHOICES else 1
+        x0 = 12 + idx * 58
+        return (x0, bottom_y + 190, 52, 22)
+
+    def _pick_run_file(self) -> str | None:
+        return browse_run_file(
+            repo_root=self.repo_root,
+            on_before_dialog=self._before_native_dialog,
+            on_after_dialog=self._after_native_dialog,
+        )
+
+    def _timeline_frame_at_pos(self, pos: tuple[int, int], total_frames: int) -> int | None:
+        if total_frames <= 1:
+            return 0
+        bottom_y = self.left_panel_height
+        rect = self._replay_timeline_rect(bottom_y)
+        bx, by, bw, bh = rect
+        x, y = pos
+        if not (bx <= x <= bx + bw and by <= y <= by + bh):
+            return None
+        ratio = (x - bx) / max(bw, 1)
+        return int(round(ratio * (total_frames - 1)))
+
+    def _hit_test_replay(self, pos: tuple[int, int]) -> str | None:
+        if not self._replay_ui_active:
+            return None
+        bottom_y = self.left_panel_height
+        rect = self._replay_timeline_rect(bottom_y)
+        bx, by, bw, bh = rect
+        x, y = pos
+        if bx <= x <= bx + bw and by <= y <= by + bh:
+            return "replay_timeline"
+        for speed in REPLAY_SPEED_CHOICES:
+            sx, sy, sw, sh = self._replay_speed_rect(bottom_y, speed)
+            if sx <= x <= sx + sw and sy <= y <= sy + sh:
+                return f"replay_speed_{speed:g}"
+        return None
+
+    def remember_agent(self, path: Path) -> None:
+        resolved = save_last_agent_path(path)
+        self.last_agent_path = str(resolved)
+        self.use_last_agent = True
+        self.custom_path = ""
+
+    def _active_agent_display_path(self) -> str:
+        if self.custom_path.strip():
+            return self.custom_path.strip()
+        if self.use_last_agent and self.last_agent_path:
+            return self.last_agent_path
+        return ""
+
+    def _sync_seed_text(self) -> None:
+        self.seed_text = str(int(self.seed))
+
+    def _commit_seed_text(self) -> None:
+        self.seed = parse_seed_text(self.seed_text, fallback=self.seed)
+        self._sync_seed_text()
+
+    def _before_native_dialog(self) -> None:
+        pygame = self._pygame
+        pygame.event.pump()
+        try:
+            pygame.display.iconify()
+        except Exception:
+            pass
+
+    def _after_native_dialog(self) -> None:
+        pygame = self._pygame
+        try:
+            self.screen = pygame.display.set_mode(
+                (
+                    PANEL_WIDTH + self.view_width,
+                    self.left_panel_height + BOTTOM_PANEL_HEIGHT,
+                ),
+                pygame.RESIZABLE,
+            )
+        except Exception:
+            pass
+
+    def _pick_agent_directory(self) -> str | None:
+        initial = self.custom_path.strip() or str(Path.cwd())
+        return browse_agent_directory(
+            initial_dir=initial,
+            on_before_dialog=self._before_native_dialog,
+            on_after_dialog=self._after_native_dialog,
+        )
+
+    def _deactivate_inputs(self) -> None:
+        if self.seed_active:
+            self._commit_seed_text()
+        self.seed_active = False
+        self.custom_active = False
+
+    def _resolve_agent_path(self) -> tuple[Path, str] | None:
+        active = self._active_agent_display_path()
+        if not active:
+            return None
+        return resolve_agent_path(Path(active).expanduser())
+
+    def get_launch_config(self) -> FlyLaunchConfig | None:
+        if self.seed_active:
+            self._commit_seed_text()
+            self.seed_active = False
+        resolved = self._resolve_agent_path()
+        if resolved is None:
+            return None
+        path, kind = resolved
+        return FlyLaunchConfig(
+            agent_path=path,
+            agent_kind=kind,  # type: ignore[arg-type]
+            seed=max(1, int(self.seed)),
+            challenge_type=int(self.challenge_type),
+        )
+
+    def _hit_test(self, pos: tuple[int, int]) -> str | None:
+        x, y = pos
+        if x < PANEL_WIDTH:
+            for button in self._buttons:
+                bx, by, bw, bh = button.rect
+                if bx <= x <= bx + bw and by <= y <= by + bh:
+                    return button.key
+            rect = self._last_agent_row_rect()
+            bx, by, bw, bh = rect
+            if bx <= x <= bx + bw and by <= y <= by + bh:
+                return "last_agent"
+            field = self._custom_field_rect()
+            bx, by, bw, bh = field
+            if bx <= x <= bx + bw and by <= y <= by + bh:
+                return "custom_field"
+            seed_field = self._seed_field_rect()
+            bx, by, bw, bh = seed_field
+            if bx <= x <= bx + bw and by <= y <= by + bh:
+                return "seed_field"
+            for row in range(3):
+                rect = self._run_row_rect(row)
+                bx, by, bw, bh = rect
+                if bx <= x <= bx + bw and by <= y <= by + bh:
+                    return f"run_{self.run_scroll + row}"
+        replay_key = self._hit_test_replay(pos)
+        if replay_key is not None:
+            return replay_key
+        return None
+
+    def pump(self) -> FlyUiEvent:
+        pygame = self._pygame
+        event = FlyUiEvent()
+        for pg_event in pygame.event.get():
+            if pg_event.type == pygame.QUIT:
+                self.quit_requested = True
+                event.quit = True
+            elif pg_event.type == pygame.KEYDOWN:
+                if pg_event.key == pygame.K_ESCAPE:
+                    if self.seed_active or self.custom_active:
+                        self._deactivate_inputs()
+                    else:
+                        self.quit_requested = True
+                        event.quit = True
+                elif self.seed_active:
+                    if pg_event.key == pygame.K_BACKSPACE:
+                        self.seed_text = self.seed_text[:-1]
+                    elif pg_event.key == pygame.K_RETURN:
+                        self._commit_seed_text()
+                        self.seed_active = False
+                    elif pg_event.unicode and pg_event.unicode.isdigit():
+                        if len(self.seed_text) < 9:
+                            self.seed_text += pg_event.unicode
+                elif self.custom_active:
+                    if pg_event.key == pygame.K_BACKSPACE:
+                        self.custom_path = self.custom_path[:-1]
+                    elif pg_event.key == pygame.K_RETURN:
+                        self.custom_active = False
+                        event.build_map = True
+                    elif pg_event.unicode and pg_event.unicode.isprintable():
+                        self.custom_path += pg_event.unicode
+            elif pg_event.type == pygame.MOUSEBUTTONDOWN:
+                if pg_event.button == 1:
+                    key = self._hit_test(pg_event.pos)
+                    if key == "custom_field":
+                        if self.seed_active:
+                            self._commit_seed_text()
+                        self.seed_active = False
+                        self.custom_active = True
+                        self.use_last_agent = False
+                    elif key == "seed_field":
+                        if self.custom_active:
+                            self.custom_active = False
+                        self.seed_active = True
+                    elif key == "last_agent" and self.last_agent_path:
+                        self._deactivate_inputs()
+                        self.use_last_agent = True
+                        self.custom_path = ""
+                        self.set_status("Using last run agent.")
+                    else:
+                        self._deactivate_inputs()
+                    if key == "build_map":
+                        event.build_map = True
+                    elif key == "open_dir":
+                        self._deactivate_inputs()
+                        picked = self._pick_agent_directory()
+                        if picked:
+                            self.custom_path = picked
+                            self.use_last_agent = False
+                            self.set_status(f"Selected: {Path(picked).name}")
+                        elif _native_picker_available():
+                            self.set_status("Folder selection cancelled.")
+                        else:
+                            self.set_status(
+                                "Folder picker unavailable. Install python3-tk or zenity."
+                            )
+                    elif key == "start":
+                        event.start = True
+                    elif key == "pause":
+                        event.pause = True
+                    elif key == "replay" and self._replay_enabled:
+                        event.replay = True
+                    elif key == "open_run":
+                        self._deactivate_inputs()
+                        self.refresh_saved_runs()
+                        picked = self._pick_run_file()
+                        if picked:
+                            event.load_run_path = picked
+                            self.selected_run_path = picked
+                            self.set_status(f"Loaded run: {Path(picked).name}")
+                        else:
+                            self.set_status("Run selection cancelled.")
+                    elif key and key.startswith("run_"):
+                        run_index = int(key.split("_", 1)[1])
+                        if 0 <= run_index < len(self.saved_runs):
+                            picked = str(self.saved_runs[run_index].path)
+                            event.load_run_path = picked
+                            self.selected_run_path = picked
+                            self.set_status(f"Loaded run: {self.saved_runs[run_index].display_name}")
+                    elif key == "replay_timeline":
+                        self._timeline_dragging = True
+                        if self._replay_ui_active:
+                            total = getattr(self, "_replay_total_frames", 1)
+                            seek = self._timeline_frame_at_pos(pg_event.pos, total)
+                            if seek is not None:
+                                event.replay_seek = seek
+                    elif key and key.startswith("replay_speed_"):
+                        event.replay_speed = float(key.split("_", 2)[2])
+                    elif key == "export" and self._export_enabled:
+                        event.export = True
+                    elif key == "cam_chase":
+                        event.camera_mode = "chase"
+                    elif key == "cam_fpv":
+                        event.camera_mode = "fpv"
+                    elif key == "cam_top":
+                        event.camera_mode = "top"
+                    elif key == "cam_overview":
+                        event.camera_mode = "overview"
+                    elif key == "zoom_in":
+                        event.zoom_in = True
+                    elif key == "zoom_out":
+                        event.zoom_out = True
+                    elif key and key.startswith("type_"):
+                        self.challenge_type = int(key.split("_", 1)[1])
+                elif pg_event.button == 4 and pg_event.pos[0] < PANEL_WIDTH:
+                    if pg_event.pos[1] >= self._run_rows_top:
+                        self.run_scroll = max(0, self.run_scroll - 1)
+                elif pg_event.button == 5 and pg_event.pos[0] < PANEL_WIDTH:
+                    if pg_event.pos[1] >= self._run_rows_top:
+                        self.run_scroll = min(
+                            max(0, len(self.saved_runs) - 3),
+                            self.run_scroll + 1,
+                        )
+            elif pg_event.type == pygame.MOUSEBUTTONUP:
+                if pg_event.button == 1:
+                    self._timeline_dragging = False
+            elif pg_event.type == pygame.MOUSEMOTION:
+                if self._timeline_dragging and self._replay_ui_active:
+                    total = getattr(self, "_replay_total_frames", 1)
+                    seek = self._timeline_frame_at_pos(pg_event.pos, total)
+                    if seek is not None:
+                        event.replay_seek = seek
+        return event
+
+    def _draw_button(self, button: _Button, *, active: bool = False, enabled: bool = True) -> None:
+        pygame = self._pygame
+        x, y, w, h = button.rect
+        if not enabled:
+            color = (70, 70, 70)
+            text_color = (160, 160, 160)
+        elif active:
+            color = (46, 125, 50)
+            text_color = (255, 255, 255)
+        else:
+            color = (55, 55, 60)
+            text_color = (230, 230, 230)
+        pygame.draw.rect(self.screen, color, (x, y, w, h), border_radius=5)
+        pygame.draw.rect(self.screen, (90, 90, 95), (x, y, w, h), width=1, border_radius=5)
+        label = self._font_small.render(button.label, True, text_color)
+        self.screen.blit(label, label.get_rect(center=(x + w // 2, y + h // 2)))
+
+    def _draw_left_panel(self) -> None:
+        pygame = self._pygame
+        panel_h = self.left_panel_height
+        pygame.draw.rect(self.screen, (18, 18, 22), (0, 0, PANEL_WIDTH, panel_h))
+        self.screen.blit(self._font_title.render("Swarm Fly", True, (240, 240, 240)), (12, 10))
+        status = self._status_message
+        if len(status) > 42:
+            status = status[:39] + "..."
+        self.screen.blit(
+            self._font_small.render(status, True, (170, 200, 255)),
+            (12, 32),
+        )
+        self.screen.blit(self._font.render("Last run agent", True, (210, 210, 210)), (12, 56))
+        last_rect = self._last_agent_row_rect()
+        has_last = bool(self.last_agent_path)
+        last_selected = self.use_last_agent and has_last and not self.custom_path.strip()
+        pygame.draw.rect(
+            self.screen,
+            (40, 70, 45) if last_selected else (34, 34, 38),
+            last_rect,
+            border_radius=4,
+        )
+        if has_last:
+            display = self.last_agent_path or ""
+            if len(display) > 40:
+                display = "..." + display[-37:]
+            last_label = self._font_small.render(display, True, (230, 230, 230))
+        else:
+            last_label = self._font_small.render("No previous agent", True, (140, 140, 145))
+        self.screen.blit(last_label, (last_rect[0] + 6, last_rect[1] + 6))
+
+        self.screen.blit(
+            self._font_small.render("Path:", True, (180, 180, 180)),
+            (108, 112),
+        )
+        field = self._custom_field_rect()
+        pygame.draw.rect(
+            self.screen,
+            (48, 48, 58) if self.custom_active else (34, 34, 38),
+            field,
+            border_radius=4,
+        )
+        display_path = self.custom_path
+        if len(display_path) > 34:
+            display_path = "..." + display_path[-31:]
+        text = display_path + ("|" if self.custom_active else "")
+        self.screen.blit(
+            self._font_small.render(text or "type path...", True, (220, 220, 220)),
+            (field[0] + 6, field[1] + 6),
+        )
+
+        self.screen.blit(self._font.render("Seed", True, (210, 210, 210)), (12, 172))
+        seed_field = self._seed_field_rect()
+        pygame.draw.rect(
+            self.screen,
+            (48, 48, 58) if self.seed_active else (34, 34, 38),
+            seed_field,
+            border_radius=4,
+        )
+        seed_display = self.seed_text + ("|" if self.seed_active else "")
+        if not seed_display.strip("|"):
+            seed_display = "|" if self.seed_active else str(self.seed)
+        self.screen.blit(
+            self._font_small.render(seed_display, True, (220, 220, 220)),
+            (seed_field[0] + 6, seed_field[1] + 5),
+        )
+        self.screen.blit(self._font.render("Map type", True, (210, 210, 210)), (12, 202))
+        self.screen.blit(self._font.render("Saved runs", True, (210, 210, 210)), (12, self._runs_label_y))
+        for row in range(3):
+            index = self.run_scroll + row
+            if index >= len(self.saved_runs):
+                break
+            run = self.saved_runs[index]
+            rect = self._run_row_rect(row)
+            selected = self.selected_run_path == str(run.path)
+            pygame.draw.rect(
+                self.screen,
+                (40, 70, 45) if selected else (34, 34, 38),
+                rect,
+                border_radius=4,
+            )
+            title = run.display_name.split("  |  ", 1)[0]
+            if len(title) > 34:
+                title = title[:31] + "..."
+            self.screen.blit(
+                self._font_small.render(title, True, (230, 230, 230)),
+                (rect[0] + 6, rect[1] + 3),
+            )
+            score_line = run.score_summary
+            if score_line is None and "  |  " in run.display_name:
+                score_line = run.display_name.split("  |  ", 1)[1]
+            if score_line:
+                score_text = score_line
+                if len(score_text) > 40:
+                    score_text = score_text[:37] + "..."
+                self.screen.blit(
+                    self._font_small.render(score_text, True, (170, 210, 170)),
+                    (rect[0] + 6, rect[1] + 15),
+                )
+
+        self.screen.blit(self._font.render("Simulation", True, (210, 210, 210)), (12, self._simulation_label_y))
+        self.screen.blit(self._font.render("Camera", True, (210, 210, 210)), (12, self._camera_label_y))
+
+        for button in self._buttons:
+            active = False
+            enabled = True
+            if button.key == "export":
+                enabled = self._export_enabled
+            elif button.key == "replay":
+                enabled = self._replay_enabled
+            elif button.key == "build_map":
+                enabled = True
+            elif button.key == "start":
+                enabled = self.map_loaded and self._sim_state not in {"building", "config"}
+                active = self._sim_state in {"running", "replay"}
+            elif button.key == "pause":
+                enabled = self.map_loaded and self._sim_state in {
+                    "running",
+                    "paused",
+                    "replay",
+                    "replay_paused",
+                }
+                active = self._sim_state in {"paused", "replay_paused"}
+            elif button.key == f"type_{self.challenge_type}":
+                active = True
+            elif button.key == f"cam_{self.camera_mode}":
+                active = True
+            self._draw_button(button, active=active, enabled=enabled)
+
+    def draw(
+        self,
+        frame_rgb: np.ndarray | None,
+        bottom_lines: list[str],
+        *,
+        placeholder_text: str | None = None,
+        replay_ui: ReplayUiState | None = None,
+    ) -> None:
+        pygame = self._pygame
+        self.screen.fill((24, 24, 28))
+        self._draw_left_panel()
+
+        view_rect = pygame.Rect(PANEL_WIDTH, 0, self.view_width, self.left_panel_height)
+        pygame.draw.rect(self.screen, (30, 30, 35), view_rect)
+        if frame_rgb is not None:
+            frame_surface = pygame.image.frombuffer(
+                np.asarray(frame_rgb, dtype=np.uint8).tobytes(),
+                (frame_rgb.shape[1], frame_rgb.shape[0]),
+                "RGB",
+            )
+            self.screen.blit(frame_surface, (PANEL_WIDTH, 0))
+        elif placeholder_text:
+            hint = self._font.render(placeholder_text, True, (180, 180, 190))
+            self.screen.blit(
+                hint,
+                hint.get_rect(
+                    center=(PANEL_WIDTH + self.view_width // 2, self.left_panel_height // 2),
+                ),
+            )
+
+        pygame.draw.line(
+            self.screen,
+            (70, 70, 75),
+            (PANEL_WIDTH, 0),
+            (PANEL_WIDTH, self.left_panel_height),
+            1,
+        )
+        pygame.draw.line(
+            self.screen,
+            (70, 70, 75),
+            (0, self.left_panel_height),
+            (PANEL_WIDTH + self.view_width, self.left_panel_height),
+            1,
+        )
+
+        bottom_y = self.left_panel_height
+        pygame.draw.rect(
+            self.screen,
+            (16, 16, 20),
+            (0, bottom_y, PANEL_WIDTH + self.view_width, BOTTOM_PANEL_HEIGHT),
+        )
+        self.screen.blit(
+            self._font_title.render("Drone Telemetry", True, (220, 220, 220)),
+            (12, bottom_y + 8),
+        )
+        line_y = bottom_y + 32
+        max_lines = 8 if replay_ui is not None and replay_ui.active else 11
+        for line in bottom_lines[:max_lines]:
+            self.screen.blit(self._font_small.render(line, True, (205, 205, 205)), (12, line_y))
+            line_y += 18
+
+        if replay_ui is not None and replay_ui.active:
+            self._replay_total_frames = max(1, int(replay_ui.total_frames))
+            self._replay_ui_active = True
+            timeline = self._replay_timeline_rect(bottom_y)
+            tx, ty, tw, th = timeline
+            pygame.draw.rect(self.screen, (40, 40, 48), timeline, border_radius=4)
+            if replay_ui.total_frames > 1:
+                progress = replay_ui.frame / max(replay_ui.total_frames - 1, 1)
+                fill_w = max(2, int(tw * progress))
+                pygame.draw.rect(
+                    self.screen,
+                    (46, 125, 50),
+                    (tx, ty, fill_w, th),
+                    border_radius=4,
+                )
+            pygame.draw.rect(self.screen, (90, 90, 95), timeline, width=1, border_radius=4)
+            timeline_label = (
+                f"Timeline  {replay_ui.t_sim:5.1f}s / {replay_ui.duration:5.1f}s  "
+                f"frame {replay_ui.frame}/{max(replay_ui.total_frames - 1, 0)}"
+            )
+            self.screen.blit(
+                self._font_small.render(timeline_label, True, (190, 190, 195)),
+                (12, bottom_y + 148),
+            )
+            for speed in REPLAY_SPEED_CHOICES:
+                rect = self._replay_speed_rect(bottom_y, speed)
+                active = abs(replay_ui.speed - speed) < 1e-6
+                pygame.draw.rect(
+                    self.screen,
+                    (46, 125, 50) if active else (55, 55, 60),
+                    rect,
+                    border_radius=4,
+                )
+                pygame.draw.rect(self.screen, (90, 90, 95), rect, width=1, border_radius=4)
+                label = self._font_small.render(f"{speed:g}x", True, (230, 230, 230))
+                self.screen.blit(label, label.get_rect(center=(rect[0] + rect[2] // 2, rect[1] + rect[3] // 2)))
+        else:
+            self._replay_ui_active = False
+            self._replay_total_frames = 1
+
+        pygame.display.flip()
+
+    def close(self) -> None:
+        try:
+            self._pygame.quit()
+        except Exception:
+            pass
+
+
+FlyCameraController = FlyRenderCamera
+CAMERA_HELP = "Use the left panel controls."
+
+def build_hud_lines(**kwargs: Any) -> list[str]:
+    return build_bottom_telemetry_lines(**kwargs)

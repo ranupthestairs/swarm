@@ -346,6 +346,21 @@ def test_video_requires_seed_or_seed_file(tmp_path, capsys):
     assert "Provide either --seed-file, or both --seed and --type." in capsys.readouterr().err
 
 
+def test_fly_bare_command_opens_setup(monkeypatch):
+    captured: dict[str, list[str]] = {}
+
+    def _fake_fly_main(argv):
+        captured["argv"] = list(argv)
+        return 0
+
+    monkeypatch.setattr("scripts.fly_model.main", _fake_fly_main)
+
+    rc = cli.main(["fly"])
+
+    assert rc == 0
+    assert captured["argv"] == []
+
+
 def test_fly_invokes_fly_model_main(monkeypatch, tmp_path):
     model_path = tmp_path / "champion_UID_1.zip"
     model_path.write_bytes(b"zip")
@@ -395,6 +410,102 @@ def test_fly_passes_fast_flag(monkeypatch, tmp_path):
 
     assert rc == 0
     assert "--fast" in captured["argv"]
+
+
+def test_fly_passes_batch_flag(monkeypatch, tmp_path):
+    source_dir = tmp_path / "my_agent"
+    source_dir.mkdir()
+    (source_dir / "drone_agent.py").write_text("class DroneFlightController:\n    pass\n")
+    batch_file = tmp_path / "batch.json"
+    batch_file.write_text('{"type1_city": [1001]}')
+    captured: dict[str, list[str]] = {}
+
+    def _fake_fly_main(argv):
+        captured["argv"] = list(argv)
+        return 0
+
+    monkeypatch.setattr("scripts.fly_model.main", _fake_fly_main)
+
+    rc = cli.main(["fly", "--source", str(source_dir), "--batch", str(batch_file)])
+
+    assert rc == 0
+    assert "--batch" in captured["argv"]
+    assert str(batch_file) in captured["argv"]
+
+
+def test_fly_rejects_batch_with_seed(tmp_path, capsys):
+    source_dir = tmp_path / "my_agent"
+    source_dir.mkdir()
+    batch_file = tmp_path / "batch.json"
+    batch_file.write_text('{"type1_city": [1001]}')
+
+    rc = cli.main(
+        [
+            "fly",
+            "--source",
+            str(source_dir),
+            "--batch",
+            str(batch_file),
+            "--seed",
+            "42",
+        ]
+    )
+
+    assert rc == 1
+    assert "--seed or --type with --batch" in capsys.readouterr().err
+
+
+def test_fly_invokes_source_directory(monkeypatch, tmp_path):
+    source_dir = tmp_path / "my_agent"
+    source_dir.mkdir()
+    (source_dir / "drone_agent.py").write_text("class DroneFlightController:\n    pass\n")
+    captured: dict[str, list[str]] = {}
+
+    def _fake_fly_main(argv):
+        captured["argv"] = list(argv)
+        return 0
+
+    monkeypatch.setattr("scripts.fly_model.main", _fake_fly_main)
+
+    rc = cli.main(
+        [
+            "fly",
+            "--source",
+            str(source_dir),
+            "--seed",
+            "1001",
+            "--type",
+            "1",
+            "--debug",
+            "--debug-every",
+            "5",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["argv"] == [
+        "--source",
+        str(source_dir),
+        "--seed",
+        "1001",
+        "--type",
+        "1",
+        "--debug",
+        "--debug-every",
+        "5",
+    ]
+
+
+def test_fly_rejects_model_and_source_together(tmp_path, capsys):
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"zip")
+    source_dir = tmp_path / "agent"
+    source_dir.mkdir()
+
+    rc = cli.main(["fly", "--model", str(model_path), "--source", str(source_dir)])
+
+    assert rc == 1
+    assert "not both" in capsys.readouterr().err
 
 
 def test_model_verify_passes_for_valid_rpc_submission(tmp_path, capsys):

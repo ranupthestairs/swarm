@@ -812,6 +812,85 @@ class OverviewCamera(_CameraBase):
         )
 
 
+class _FfmpegH264Writer:
+    """Write broadly-compatible H.264 MP4 using the bundled ffmpeg binary."""
+
+    def __init__(self, path: Path, fps: int, width: int, height: int):
+        import imageio_ffmpeg
+        import subprocess
+
+        self._width = int(width)
+        self._height = int(height)
+        if self._width % 2 != 0 or self._height % 2 != 0:
+            raise ValueError(
+                f"Video width and height must be even for H.264 export (got {width}x{height})."
+            )
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-s",
+            f"{self._width}x{self._height}",
+            "-pix_fmt",
+            "rgb24",
+            "-r",
+            str(float(fps)),
+            "-i",
+            "-",
+            "-an",
+            "-vcodec",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(path),
+        ]
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        if self._proc.stdin is None:
+            raise RuntimeError(f"Failed to open ffmpeg stdin for {path}")
+
+    @staticmethod
+    def _prepare_rgb_frame(frame: np.ndarray, width: int, height: int) -> np.ndarray:
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        if frame.ndim == 2:
+            frame = np.repeat(frame[..., None], 3, axis=2)
+        frame = np.asarray(frame[:, :, :3], dtype=np.uint8)
+        if frame.shape[0] != height or frame.shape[1] != width:
+            raise ValueError(
+                f"Frame size {frame.shape[1]}x{frame.shape[0]} does not match video {width}x{height}"
+            )
+        return np.ascontiguousarray(frame)
+
+    def append_data(self, frame: np.ndarray) -> None:
+        if self._proc.stdin is None:
+            raise RuntimeError("ffmpeg writer is closed")
+        payload = self._prepare_rgb_frame(frame, self._width, self._height)
+        self._proc.stdin.write(payload.tobytes())
+
+    def close(self) -> None:
+        if self._proc.stdin is not None:
+            self._proc.stdin.close()
+            self._proc.stdin = None
+        stderr = b""
+        if self._proc.stderr is not None:
+            stderr = self._proc.stderr.read()
+        code = self._proc.wait()
+        if code != 0:
+            detail = stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"ffmpeg failed to encode video (exit {code}): {detail}")
+
+
 class _Cv2VideoWriter:
     """Small adapter matching the `imageio` writer API used below."""
 
@@ -836,10 +915,23 @@ class _Cv2VideoWriter:
 
 
 def _open_video_writer(path: Path, fps: int, width: int, height: int) -> Any:
+    """Open an MP4 writer using H.264 when possible for player compatibility."""
+    try:
+        import imageio_ffmpeg  # noqa: F401
+
+        return _FfmpegH264Writer(path, fps=fps, width=width, height=height)
+    except ModuleNotFoundError:
+        pass
     try:
         import imageio
 
-        return imageio.get_writer(str(path), fps=fps)
+        return imageio.get_writer(
+            str(path),
+            fps=fps,
+            codec="libx264",
+            pixelformat="yuv420p",
+            macro_block_size=1,
+        )
     except ModuleNotFoundError:
         return _Cv2VideoWriter(path, fps=fps, width=width, height=height)
 

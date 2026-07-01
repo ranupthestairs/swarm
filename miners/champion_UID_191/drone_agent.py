@@ -732,6 +732,7 @@ class DroneFlightController:
 
         if distance_to_search_area <= MAX_REAR_DIST or self._mode in ("navigation", "landing"):
             goal_visibility_prob, predicted_goal_position, predicted_goal_position_cov, predicted_platform_velocity = self._find_platform(depth, state)
+            self._last_goal_visibility_prob = float(goal_visibility_prob)
             lock_goal_probability = goal_visibility_prob
             if goal_visibility_prob >= STATIC_LOCK_MIN_PROBABILITY:
                 lock_goal_position = predicted_goal_position.copy()

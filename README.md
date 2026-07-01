@@ -183,7 +183,30 @@ swarm model verify --model Submission/submission.zip  # Verify structure and com
 swarm benchmark --model Submission/submission.zip --workers 4  # Run benchmark
 swarm benchmark --model Submission/submission.zip --seeds-per-group 1  # Quick test
 swarm report                                          # View results
+
+# Debug your source code in real-time 3D
+swarm fly --source miners/champion_UID_191/ --seed 1001 --type 1 --debug
+
+# Faster sim (no real-time sleep) + debug every 10 frames
+swarm fly --source miners/champion_UID_191/ --seed 1001 --type 1 --fast --debug --debug-every 10
+
+# Batch headless runs from a JSON seed file (no viewer; saves to fly_runs/)
+swarm fly --source miners/champion_UID_191/ --batch my_seeds.json
 ```
+
+Batch JSON example (`my_seeds.json`):
+
+```json
+{
+  "type1_city": [1001, 1002],
+  "type2_open": [2001],
+  "type3_mountain": [3001]
+}
+```
+
+You can also use numeric type keys (`"1": [1001]`) or a list form: `[{"type": 1, "seeds": [1001, 1002]}]`.
+
+Each completed flight is saved under `fly_runs/` in this repo (trajectory `.flytraj.json.gz` and exported `.mp4` use the same basename). In the fly UI, use **Saved runs** / **Open Run** to load a past flight, then **Replay** with the timeline scrubber and **0.5x / 1x / 2x / 4x** speed controls.
 
 <p align="center">
   <sub>Full docs: <a href="docs/CLI_readme.md">CLI reference</a>.</sub>

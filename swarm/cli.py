@@ -732,26 +732,63 @@ def _cmd_video(args: argparse.Namespace) -> int:
 
 
 def _build_fly_argv(args: argparse.Namespace) -> list[str]:
-    argv = ["--model", str(args.model), "--seed", str(args.seed)]
+    argv: list[str] = []
+    if getattr(args, "source", None) is not None:
+        argv.extend(["--source", str(args.source)])
+    elif args.model is not None:
+        argv.extend(["--model", str(args.model)])
+    if args.seed is not None:
+        argv.extend(["--seed", str(args.seed)])
     if args.type is not None:
         argv.extend(["--type", str(args.type)])
+    if getattr(args, "no_setup", False):
+        argv.append("--no-setup")
     if args.fast:
         argv.append("--fast")
+    if getattr(args, "debug", False):
+        argv.append("--debug")
+    if getattr(args, "debug_every", None) not in (None, 25):
+        argv.extend(["--debug-every", str(args.debug_every)])
+    if getattr(args, "camera", "chase") != "chase":
+        argv.extend(["--camera", str(args.camera)])
+    if getattr(args, "width", None) not in (None, 960):
+        argv.extend(["--width", str(args.width)])
+    if getattr(args, "height", None) not in (None, 540):
+        argv.extend(["--height", str(args.height)])
+    if getattr(args, "video_out", None) is not None:
+        argv.extend(["--video-out", str(args.video_out)])
+    if getattr(args, "batch", None) is not None:
+        argv.extend(["--batch", str(args.batch)])
     return argv
 
 
 def _cmd_fly(args: argparse.Namespace) -> int:
-    if args.model is None:
-        downloaded = _download_champion_model()
-        if downloaded is None:
-            print("No --model specified and champion download failed.", file=sys.stderr)
-            return 1
-        args.model = downloaded
-
-    model_path = Path(args.model)
-    if not model_path.exists():
-        print(f"Model not found: {model_path}", file=sys.stderr)
+    if args.model is not None and getattr(args, "source", None) is not None:
+        print("Use either --model or --source, not both.", file=sys.stderr)
         return 1
+
+    if getattr(args, "batch", None) is not None:
+        if args.seed is not None or args.type is not None:
+            print("Do not pass --seed or --type with --batch; use the JSON file.", file=sys.stderr)
+            return 1
+        if args.model is None and getattr(args, "source", None) is None:
+            print("Batch mode requires --model or --source.", file=sys.stderr)
+            return 1
+
+    if args.model is not None:
+        model_path = Path(args.model)
+        if not model_path.exists():
+            print(f"Model not found: {model_path}", file=sys.stderr)
+            return 1
+
+    if getattr(args, "source", None) is not None:
+        source_path = Path(args.source)
+        if not source_path.exists():
+            print(f"Source directory not found: {source_path}", file=sys.stderr)
+            return 1
+        if not source_path.is_dir():
+            print(f"Source path is not a directory: {source_path}", file=sys.stderr)
+            return 1
 
     try:
         from scripts.fly_model import main as fly_main
@@ -1457,25 +1494,80 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         type=Path,
         default=None,
-        help="Path to submission zip. If omitted, auto-downloads the current champion.",
+        help="Optional submission zip. Choose in the setup UI if omitted.",
+    )
+    fly_parser.add_argument(
+        "--source",
+        type=Path,
+        default=None,
+        help="Optional agent source directory. Choose in the setup UI if omitted.",
     )
     fly_parser.add_argument(
         "--seed",
         type=int,
-        default=42,
-        help="Map seed (default: 42).",
+        default=None,
+        help="Optional map seed. Choose in the setup UI if omitted.",
     )
     fly_parser.add_argument(
         "--type",
         type=int,
         choices=[1, 2, 3, 4, 5, 6],
         default=None,
-        help="Challenge type (1=City 2=Open 3=Mountain 4=Village 5=Warehouse 6=Forest). Inferred from seed if omitted.",
+        help="Optional challenge type. Choose in the setup UI if omitted.",
+    )
+    fly_parser.add_argument(
+        "--no-setup",
+        action="store_true",
+        help="Skip the setup UI (requires --model or --source, and --type).",
     )
     fly_parser.add_argument(
         "--fast",
         action="store_true",
         help="Run as fast as possible instead of real-time pacing.",
+    )
+    fly_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print per-frame debug telemetry (position, search vector, mode, goal detection, speed, action).",
+    )
+    fly_parser.add_argument(
+        "--debug-every",
+        type=int,
+        default=25,
+        help="Emit one terminal debug line every N simulation frames.",
+    )
+    fly_parser.add_argument(
+        "--camera",
+        choices=["chase", "fpv", "top", "overview"],
+        default="chase",
+        help="Initial camera mode. Switch with the left-panel camera buttons.",
+    )
+    fly_parser.add_argument(
+        "--width",
+        type=int,
+        default=960,
+        help="3D viewport width in pixels.",
+    )
+    fly_parser.add_argument(
+        "--height",
+        type=int,
+        default=540,
+        help="3D viewport height in pixels.",
+    )
+    fly_parser.add_argument(
+        "--video-out",
+        type=Path,
+        default=None,
+        help="Output path for the Export Video button.",
+    )
+    fly_parser.add_argument(
+        "--batch",
+        type=Path,
+        default=None,
+        help=(
+            "JSON file with map types and seeds. Runs headlessly without the viewer "
+            "and saves trajectories to fly_runs/."
+        ),
     )
     fly_parser.set_defaults(func=_cmd_fly)
 

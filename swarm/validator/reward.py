@@ -39,7 +39,7 @@ from swarm.constants import (
     SPEED_LIMIT,
 )
 
-__all__ = ["flight_reward"]
+__all__ = ["flight_reward", "flight_score_details"]
 
 
 def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
@@ -83,6 +83,78 @@ def _calculate_safety_term(
     return (min_clearance - SAFETY_DISTANCE_DANGER) / (safe - SAFETY_DISTANCE_DANGER)
 
 
+def flight_score_details(
+    success: bool,
+    t: float,
+    horizon: float,
+    task: Optional["MapTask"] = None,
+    *,
+    min_clearance: Optional[float] = None,
+    collision: bool = False,
+    w_success: float = REWARD_W_SUCCESS,
+    w_t: float = REWARD_W_TIME,
+    w_safety: float = REWARD_W_SAFETY,
+    legitimate_model: bool = True,
+) -> dict[str, float | bool | None]:
+    """Compute validator score and expose the success/time/safety terms."""
+    if horizon <= 0:
+        raise ValueError("'horizon' must be positive")
+
+    target_time: float | None = None
+    if collision:
+        score = 0.01 if legitimate_model and t > 0.0 else 0.0
+        return {
+            "score": float(score),
+            "success_term": 1.0 if success else 0.0,
+            "time_term": 0.0,
+            "safety_term": 0.0,
+            "target_time_sec": target_time,
+            "collision": True,
+            "min_clearance_m": min_clearance,
+        }
+
+    success_term = 1.0 if success else 0.0
+    if success_term == 0.0:
+        score = 0.01 if legitimate_model and t > 0.0 else 0.0
+        return {
+            "score": float(score),
+            "success_term": 0.0,
+            "time_term": 0.0,
+            "safety_term": 0.0,
+            "target_time_sec": target_time,
+            "collision": False,
+            "min_clearance_m": min_clearance,
+        }
+
+    if task is not None:
+        target_time = _calculate_target_time(task)
+        if t <= target_time:
+            time_term = 1.0
+        elif horizon <= target_time:
+            time_term = 0.0
+        else:
+            time_term = _clamp(1.0 - (t - target_time) / (horizon - target_time))
+    else:
+        time_term = _clamp(1.0 - t / horizon)
+
+    challenge_type = getattr(task, "challenge_type", 0) if task is not None else 0
+    if min_clearance is not None:
+        safety_term = _calculate_safety_term(min_clearance, collision, challenge_type)
+    else:
+        safety_term = 1.0 if not collision else 0.0
+
+    score = (w_success * success_term) + (w_t * time_term) + (w_safety * safety_term)
+    return {
+        "score": float(_clamp(score)),
+        "success_term": float(success_term),
+        "time_term": float(time_term),
+        "safety_term": float(safety_term),
+        "target_time_sec": target_time,
+        "collision": bool(collision),
+        "min_clearance_m": min_clearance,
+    }
+
+
 def flight_reward(
     success: bool,
     t: float,
@@ -124,39 +196,17 @@ def flight_reward(
     float
         A score in the range ``[0, 1]``.
     """
-
-    if horizon <= 0:
-        raise ValueError("'horizon' must be positive")
-
-    if collision:
-        if legitimate_model and t > 0.0:
-            return 0.01
-        return 0.0
-
-    success_term = 1.0 if success else 0.0
-
-    if success_term == 0.0:
-        if legitimate_model and t > 0.0:
-            return 0.01
-        return 0.0
-
-    if task is not None:
-        target_time = _calculate_target_time(task)
-
-        if t <= target_time:
-            time_term = 1.0
-        elif horizon <= target_time:
-            time_term = 0.0
-        else:
-            time_term = _clamp(1.0 - (t - target_time) / (horizon - target_time))
-    else:
-        time_term = _clamp(1.0 - t / horizon)
-
-    challenge_type = getattr(task, "challenge_type", 0) if task is not None else 0
-    if min_clearance is not None:
-        safety_term = _calculate_safety_term(min_clearance, collision, challenge_type)
-    else:
-        safety_term = 1.0 if not collision else 0.0
-
-    score = (w_success * success_term) + (w_t * time_term) + (w_safety * safety_term)
-    return _clamp(score)
+    return float(
+        flight_score_details(
+            success,
+            t,
+            horizon,
+            task,
+            min_clearance=min_clearance,
+            collision=collision,
+            w_success=w_success,
+            w_t=w_t,
+            w_safety=w_safety,
+            legitimate_model=legitimate_model,
+        )["score"]
+    )

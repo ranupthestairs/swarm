@@ -20,6 +20,7 @@ from swarm.validator.reward import (
     _calculate_target_time,
     _clamp,
     flight_reward,
+    flight_score_details,
 )
 
 
@@ -130,3 +131,24 @@ def test_flight_reward_uses_safety_interpolation():
     )
     # success=1, time=1, safety=0.5
     assert math.isclose(score, 0.45 + 0.45 + 0.05, rel_tol=1e-9)
+
+
+def test_flight_score_details_matches_reward():
+    task = _sample_task()
+    details = flight_score_details(
+        success=True,
+        t=0.1,
+        horizon=60.0,
+        task=task,
+        min_clearance=SAFETY_DISTANCE_SAFE + 0.1,
+    )
+    assert details["score"] == flight_reward(
+        success=True,
+        t=0.1,
+        horizon=60.0,
+        task=task,
+        min_clearance=SAFETY_DISTANCE_SAFE + 0.1,
+    )
+    assert details["success_term"] == 1.0
+    assert details["time_term"] == 1.0
+    assert details["safety_term"] == 1.0
