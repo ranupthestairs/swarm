@@ -24,6 +24,8 @@ from swarm.core.fly_trajectory import (
 CAMERA_MODES: tuple[str, ...] = ("chase", "fpv", "top", "overview")
 PANEL_WIDTH = 320
 BOTTOM_PANEL_HEIGHT = 228
+REPLAY_BAR_HEIGHT = 58
+REPLAY_BAR_MARGIN = 12
 LEFT_PANEL_BOTTOM_PADDING = 24
 REPLAY_SPEED_CHOICES: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
 DEFAULT_VIEW_WIDTH = 960
@@ -648,14 +650,23 @@ class FlySimulatorWindow:
     def _run_row_rect(self, row_index: int) -> tuple[int, int, int, int]:
         return (10, self._run_rows_top + row_index * 30, PANEL_WIDTH - 20, 28)
 
-    def _replay_timeline_rect(self, bottom_y: int) -> tuple[int, int, int, int]:
-        width = PANEL_WIDTH + self.view_width - 24
-        return (12, bottom_y + 168, width, 16)
+    def _replay_bar_top(self) -> int:
+        return self.left_panel_height - REPLAY_BAR_HEIGHT
 
-    def _replay_speed_rect(self, bottom_y: int, speed: float) -> tuple[int, int, int, int]:
+    def _replay_timeline_rect(self) -> tuple[int, int, int, int]:
+        top = self._replay_bar_top()
+        x0 = PANEL_WIDTH + REPLAY_BAR_MARGIN
+        width = max(120, self.view_width - 2 * REPLAY_BAR_MARGIN)
+        return (x0, top + 20, width, 14)
+
+    def _replay_speed_rect(self, speed: float) -> tuple[int, int, int, int]:
+        top = self._replay_bar_top()
         idx = REPLAY_SPEED_CHOICES.index(speed) if speed in REPLAY_SPEED_CHOICES else 1
-        x0 = 12 + idx * 58
-        return (x0, bottom_y + 190, 52, 22)
+        x0 = PANEL_WIDTH + REPLAY_BAR_MARGIN + idx * 58
+        return (x0, top + 38, 52, 18)
+
+    def _replay_label_pos(self) -> tuple[int, int]:
+        return (PANEL_WIDTH + REPLAY_BAR_MARGIN, self._replay_bar_top() + 4)
 
     def _pick_run_file(self) -> str | None:
         return browse_run_file(
@@ -667,8 +678,7 @@ class FlySimulatorWindow:
     def _timeline_frame_at_pos(self, pos: tuple[int, int], total_frames: int) -> int | None:
         if total_frames <= 1:
             return 0
-        bottom_y = self.left_panel_height
-        rect = self._replay_timeline_rect(bottom_y)
+        rect = self._replay_timeline_rect()
         bx, by, bw, bh = rect
         x, y = pos
         if not (bx <= x <= bx + bw and by <= y <= by + bh):
@@ -679,17 +689,64 @@ class FlySimulatorWindow:
     def _hit_test_replay(self, pos: tuple[int, int]) -> str | None:
         if not self._replay_ui_active:
             return None
-        bottom_y = self.left_panel_height
-        rect = self._replay_timeline_rect(bottom_y)
-        bx, by, bw, bh = rect
         x, y = pos
+        if x < PANEL_WIDTH:
+            return None
+        rect = self._replay_timeline_rect()
+        bx, by, bw, bh = rect
         if bx <= x <= bx + bw and by <= y <= by + bh:
             return "replay_timeline"
         for speed in REPLAY_SPEED_CHOICES:
-            sx, sy, sw, sh = self._replay_speed_rect(bottom_y, speed)
+            sx, sy, sw, sh = self._replay_speed_rect(speed)
             if sx <= x <= sx + sw and sy <= y <= sy + sh:
                 return f"replay_speed_{speed:g}"
         return None
+
+    def _draw_replay_overlay(self, replay_ui: ReplayUiState) -> None:
+        pygame = self._pygame
+        top = self._replay_bar_top()
+        overlay = pygame.Surface((self.view_width, REPLAY_BAR_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((12, 12, 16, 210))
+        self.screen.blit(overlay, (PANEL_WIDTH, top))
+
+        timeline_label = (
+            f"Replay  {replay_ui.t_sim:5.1f}s / {replay_ui.duration:5.1f}s  "
+            f"frame {replay_ui.frame}/{max(replay_ui.total_frames - 1, 0)}"
+        )
+        self.screen.blit(
+            self._font_small.render(timeline_label, True, (220, 220, 225)),
+            self._replay_label_pos(),
+        )
+
+        timeline = self._replay_timeline_rect()
+        tx, ty, tw, th = timeline
+        pygame.draw.rect(self.screen, (40, 40, 48), timeline, border_radius=4)
+        if replay_ui.total_frames > 1:
+            progress = replay_ui.frame / max(replay_ui.total_frames - 1, 1)
+            fill_w = max(2, int(tw * progress))
+            pygame.draw.rect(
+                self.screen,
+                (46, 125, 50),
+                (tx, ty, fill_w, th),
+                border_radius=4,
+            )
+        pygame.draw.rect(self.screen, (90, 90, 95), timeline, width=1, border_radius=4)
+
+        for speed in REPLAY_SPEED_CHOICES:
+            rect = self._replay_speed_rect(speed)
+            active = abs(replay_ui.speed - speed) < 1e-6
+            pygame.draw.rect(
+                self.screen,
+                (46, 125, 50) if active else (55, 55, 60),
+                rect,
+                border_radius=4,
+            )
+            pygame.draw.rect(self.screen, (90, 90, 95), rect, width=1, border_radius=4)
+            label = self._font_small.render(f"{speed:g}x", True, (230, 230, 230))
+            self.screen.blit(
+                label,
+                label.get_rect(center=(rect[0] + rect[2] // 2, rect[1] + rect[3] // 2)),
+            )
 
     def remember_agent(self, path: Path) -> None:
         resolved = save_last_agent_path(path)
@@ -1106,6 +1163,14 @@ class FlySimulatorWindow:
                 ),
             )
 
+        if replay_ui is not None and replay_ui.active:
+            self._replay_total_frames = max(1, int(replay_ui.total_frames))
+            self._replay_ui_active = True
+            self._draw_replay_overlay(replay_ui)
+        else:
+            self._replay_ui_active = False
+            self._replay_total_frames = 1
+
         pygame.draw.line(
             self.screen,
             (70, 70, 75),
@@ -1132,50 +1197,9 @@ class FlySimulatorWindow:
             (12, bottom_y + 8),
         )
         line_y = bottom_y + 32
-        max_lines = 8 if replay_ui is not None and replay_ui.active else 11
-        for line in bottom_lines[:max_lines]:
+        for line in bottom_lines[:11]:
             self.screen.blit(self._font_small.render(line, True, (205, 205, 205)), (12, line_y))
             line_y += 18
-
-        if replay_ui is not None and replay_ui.active:
-            self._replay_total_frames = max(1, int(replay_ui.total_frames))
-            self._replay_ui_active = True
-            timeline = self._replay_timeline_rect(bottom_y)
-            tx, ty, tw, th = timeline
-            pygame.draw.rect(self.screen, (40, 40, 48), timeline, border_radius=4)
-            if replay_ui.total_frames > 1:
-                progress = replay_ui.frame / max(replay_ui.total_frames - 1, 1)
-                fill_w = max(2, int(tw * progress))
-                pygame.draw.rect(
-                    self.screen,
-                    (46, 125, 50),
-                    (tx, ty, fill_w, th),
-                    border_radius=4,
-                )
-            pygame.draw.rect(self.screen, (90, 90, 95), timeline, width=1, border_radius=4)
-            timeline_label = (
-                f"Timeline  {replay_ui.t_sim:5.1f}s / {replay_ui.duration:5.1f}s  "
-                f"frame {replay_ui.frame}/{max(replay_ui.total_frames - 1, 0)}"
-            )
-            self.screen.blit(
-                self._font_small.render(timeline_label, True, (190, 190, 195)),
-                (12, bottom_y + 148),
-            )
-            for speed in REPLAY_SPEED_CHOICES:
-                rect = self._replay_speed_rect(bottom_y, speed)
-                active = abs(replay_ui.speed - speed) < 1e-6
-                pygame.draw.rect(
-                    self.screen,
-                    (46, 125, 50) if active else (55, 55, 60),
-                    rect,
-                    border_radius=4,
-                )
-                pygame.draw.rect(self.screen, (90, 90, 95), rect, width=1, border_radius=4)
-                label = self._font_small.render(f"{speed:g}x", True, (230, 230, 230))
-                self.screen.blit(label, label.get_rect(center=(rect[0] + rect[2] // 2, rect[1] + rect[3] // 2)))
-        else:
-            self._replay_ui_active = False
-            self._replay_total_frames = 1
 
         pygame.display.flip()
 

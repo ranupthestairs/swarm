@@ -87,6 +87,25 @@ def test_left_panel_min_height_fits_controls() -> None:
     assert compute_left_panel_min_height() == LEFT_PANEL_MIN_HEIGHT
 
 
+def test_replay_controls_sit_inside_viewport() -> None:
+    from swarm.core.fly_viewer import PANEL_WIDTH, REPLAY_BAR_HEIGHT, FlySimulatorWindow
+
+    class _FakeWindow(FlySimulatorWindow):
+        def __init__(self) -> None:
+            self.view_width = 960
+            self.left_panel_height = 700
+            self._replay_ui_active = True
+
+    window = _FakeWindow()
+    timeline = window._replay_timeline_rect()
+    speed = window._replay_speed_rect(1.0)
+    assert timeline[0] >= PANEL_WIDTH
+    assert speed[0] >= PANEL_WIDTH
+    assert timeline[1] + timeline[3] <= window.left_panel_height
+    assert speed[1] + speed[3] <= window.left_panel_height
+    assert window._replay_bar_top() == window.left_panel_height - REPLAY_BAR_HEIGHT
+
+
 def test_browse_agent_directory_without_tkinter(monkeypatch) -> None:
     import builtins
 
