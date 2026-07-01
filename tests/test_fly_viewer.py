@@ -10,6 +10,7 @@ from swarm.core.fly_viewer import (
     LEFT_PANEL_MIN_HEIGHT,
     build_bottom_telemetry_lines,
     browse_agent_directory,
+    colourise_depth_normalized,
     parse_seed_text,
     _goal_detection_lines,
 )
@@ -120,8 +121,18 @@ def test_browse_agent_directory_without_tkinter(monkeypatch) -> None:
     assert browse_agent_directory() is None
 
 
+def test_colourise_depth_normalized_returns_rgb_uint8() -> None:
+    depth = np.zeros((128, 128, 1), dtype=np.float32)
+    depth[64:, :] = 1.0
+    rgb = colourise_depth_normalized(depth)
+    assert rgb.shape == (128, 128, 3)
+    assert rgb.dtype == np.uint8
+    assert int(rgb[0, 0, 0]) != int(rgb[-1, 0, 0])
+
+
 def test_parse_seed_text_clamps_and_fallback() -> None:
     assert parse_seed_text("1001") == 1001
+    assert parse_seed_text("3140505285") == 3140505285
     assert parse_seed_text("0", fallback=42) == 1
     assert parse_seed_text("abc", fallback=42) == 42
     assert parse_seed_text("", fallback=7) == 7

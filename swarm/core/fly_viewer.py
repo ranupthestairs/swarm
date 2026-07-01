@@ -28,9 +28,16 @@ REPLAY_BAR_HEIGHT = 58
 REPLAY_BAR_MARGIN = 12
 LEFT_PANEL_BOTTOM_PADDING = 24
 REPLAY_SPEED_CHOICES: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
-DEFAULT_VIEW_WIDTH = 960
-DEFAULT_VIEW_HEIGHT = 540
+# Default fly viewport (16:9). Lower than 960x540 for faster CPU rendering; override with --width/--height.
+DEFAULT_VIEW_WIDTH = 640
+DEFAULT_VIEW_HEIGHT = 360
 VIDEO_FPS = 25
+DEPTH_PREVIEW_SIZE = 140
+DEPTH_PREVIEW_INSET = 10
+DEPTH_PREVIEW_GAP = 6
+DEPTH_COLORMAP_NAME = "inferno"
+# Validator seeds are drawn from [0, 2**32 - 1] (up to 12 digits).
+SEED_TEXT_MAX_LEN = 12
 
 # Match scripts/generate_video.py chase/fpv tuning for stable live preview.
 CHASE_DISTANCE_BACK_M = 2.5
@@ -326,6 +333,23 @@ def parse_seed_text(text: str, *, fallback: int = 42) -> int:
         return max(1, int(cleaned))
     except ValueError:
         return max(1, int(fallback))
+
+
+def colourise_depth_normalized(depth: np.ndarray) -> np.ndarray:
+    """Map the agent's normalized depth observation to an RGB preview frame."""
+    array = np.asarray(depth, dtype=np.float32)
+    if array.size == 0:
+        return np.zeros((128, 128, 3), dtype=np.uint8)
+    plane = np.clip(array.reshape(array.shape[0], array.shape[1]), 0.0, 1.0)
+    try:
+        import matplotlib.cm as cm
+
+        cmap = cm.colormaps.get_cmap(DEPTH_COLORMAP_NAME)
+        rgb = cmap(1.0 - plane)[:, :, :3]
+        return (rgb * 255).astype(np.uint8)
+    except Exception:
+        grey = (255 * (1.0 - plane)).astype(np.uint8)
+        return np.stack([grey, grey, grey], axis=-1)
 
 
 def _drone_basis(quat: Sequence[float]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -923,7 +947,7 @@ class FlySimulatorWindow:
                         self._commit_seed_text()
                         self.seed_active = False
                     elif pg_event.unicode and pg_event.unicode.isdigit():
-                        if len(self.seed_text) < 9:
+                        if len(self.seed_text) < SEED_TEXT_MAX_LEN:
                             self.seed_text += pg_event.unicode
                 elif self.custom_active:
                     if pg_event.key == pygame.K_BACKSPACE:
@@ -1182,6 +1206,72 @@ class FlySimulatorWindow:
                 active = True
             self._draw_button(button, active=active, enabled=enabled)
 
+    def _blit_camera_panel(
+        self,
+        frame_rgb: np.ndarray,
+        *,
+        x: int,
+        y: int,
+        size: int,
+        label: str,
+    ) -> None:
+        pygame = self._pygame
+        frame = np.asarray(frame_rgb, dtype=np.uint8)
+        if frame.ndim == 2:
+            frame = np.repeat(frame[..., None], 3, axis=2)
+        frame = np.ascontiguousarray(frame[:, :, :3], dtype=np.uint8).copy()
+        surface = pygame.image.frombuffer(
+            frame.tobytes(),
+            (frame.shape[1], frame.shape[0]),
+            "RGB",
+        )
+        if surface.get_width() != size or surface.get_height() != size:
+            surface = pygame.transform.scale(surface, (size, size))
+
+        backing = pygame.Surface((size + 8, size + 22), pygame.SRCALPHA)
+        backing.fill((12, 12, 16, 210))
+        self.screen.blit(backing, (x - 4, y - 18))
+        self.screen.blit(
+            self._font_small.render(label, True, (220, 220, 225)),
+            (x, y - 16),
+        )
+        pygame.draw.rect(
+            self.screen,
+            (90, 90, 95),
+            (x - 1, y - 1, size + 2, size + 2),
+            width=1,
+            border_radius=4,
+        )
+        self.screen.blit(surface, (x, y))
+
+    def _draw_drone_camera_panels(
+        self,
+        *,
+        drone_cam_rgb: np.ndarray | None,
+        depth_rgb: np.ndarray | None,
+    ) -> None:
+        size = DEPTH_PREVIEW_SIZE
+        inset = DEPTH_PREVIEW_INSET
+        x = PANEL_WIDTH + self.view_width - size - inset
+        y = inset
+        if drone_cam_rgb is not None:
+            self._blit_camera_panel(
+                drone_cam_rgb,
+                x=x,
+                y=y,
+                size=size,
+                label="Drone cam",
+            )
+            y += size + DEPTH_PREVIEW_GAP
+        if depth_rgb is not None:
+            self._blit_camera_panel(
+                depth_rgb,
+                x=x,
+                y=y,
+                size=size,
+                label="Depth",
+            )
+
     def draw(
         self,
         frame_rgb: np.ndarray | None,
@@ -1189,6 +1279,8 @@ class FlySimulatorWindow:
         *,
         placeholder_text: str | None = None,
         replay_ui: ReplayUiState | None = None,
+        drone_cam_rgb: np.ndarray | None = None,
+        depth_rgb: np.ndarray | None = None,
     ) -> None:
         pygame = self._pygame
         self.screen.fill((24, 24, 28))
@@ -1219,6 +1311,14 @@ class FlySimulatorWindow:
         else:
             self._replay_ui_active = False
             self._replay_total_frames = 1
+
+        if frame_rgb is not None and (
+            drone_cam_rgb is not None or depth_rgb is not None
+        ):
+            self._draw_drone_camera_panels(
+                drone_cam_rgb=drone_cam_rgb,
+                depth_rgb=depth_rgb,
+            )
 
         pygame.draw.line(
             self.screen,

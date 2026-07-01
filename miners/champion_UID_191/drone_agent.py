@@ -24,6 +24,7 @@ STATIC_LOCK_MAX_MOTION_M = 0.5
 STATIC_LOCK_MAX_AVG_DISTANCE_M = 6.0
 STATIC_LOCK_MAX_REVERSE_SPEED = 0.08
 VILLAGE_GOAL_VISIBLE_THRESHOLD = 0.8
+VILLAGE_LANDING_MIN_PROBABILITY = 0.9
 VILLAGE_SEARCH_VECTOR_DAMP_RADIUS_M = 3.0
 VILLAGE_SEARCH_MIN_DIRECTION_TRUST = 0.2
 VILLAGE_SEARCH_MIN_VERTICAL_LIMIT = 0.35
@@ -897,13 +898,13 @@ class DroneFlightController:
                     elif np.linalg.norm(self._first_plat_pos[0:2] - self.landing_platform[0:2]) > 0.7:
                         self.tracking = True
 
-                if distance_to_goal < 4.0 and self.is_find_P:
+                if self._can_enter_landing_mode(distance_to_goal):
                     self._mode = "landing"
                     self.controller.reset()
                     if self._static_landing_ready and self._static_lock_anchor is not None and self._is_static_landing_candidate():
                         self._landing_committed = True
                         self._landing_commit_position = self._static_lock_anchor.copy()
-                        self._landing_platform_position = self._landing_commit_position.copy() + np.array([0.0, 0.0, 0.3])
+                        self._landing_platform_position = self._landing_commit_position.copy() + np.array([0.0, 0.0, 0.29])
                     else:
                         self._landing_committed = False
                         self._landing_commit_position = None
@@ -935,7 +936,7 @@ class DroneFlightController:
             if visible_goal_position is not None or committed_landing:
                 if committed_landing:
                     if self._landing_platform_position is None:
-                        self._landing_platform_position = self._landing_commit_position.copy() + np.array([0.0, 0.0, 0.3])
+                        self._landing_platform_position = self._landing_commit_position.copy() + np.array([0.0, 0.0, 0.29])
                     goal_position = self._landing_platform_position.copy()
                 else:
                     goal_position = visible_goal_position.copy()
@@ -943,9 +944,9 @@ class DroneFlightController:
 
                 if self._landing_platform_position is None:
                     if self.move_in_auto_mode:
-                        self._landing_platform_position = self.reverse_landing_platform.copy() + np.array([0.0, 0.0, 0.3])
+                        self._landing_platform_position = self.reverse_landing_platform.copy() + np.array([0.0, 0.0, 0.29])
                     else:
-                        self._landing_platform_position = self.landing_platform.copy() + np.array([0.0, 0.0, 0.3])
+                        self._landing_platform_position = self.landing_platform.copy() + np.array([0.0, 0.0, 0.29])
                 elif visible_goal_position is not None and not committed_landing:
                     dist_drone_to_anchor = float(np.linalg.norm(drone_position - self._landing_platform_position))
                     dxy = float(np.linalg.norm(goal_position[0:2] - self._landing_platform_position[0:2]))
@@ -1029,7 +1030,7 @@ class DroneFlightController:
                 goal_position = self.reverse_landing_platform.copy() + self.reverse_d*13
                 horizontal_distance_to_current_goal_position = float(np.linalg.norm(goal_position[0:2] - drone_position[0:2]))
                 if self._landing_platform_position is None:
-                    self._landing_platform_position = visible_goal_position_cov.copy() + np.array([0.0, 0.0, 0.3])
+                    self._landing_platform_position = visible_goal_position_cov.copy() + np.array([0.0, 0.0, 0.29])
                 goal_position[2] = self._landing_platform_position[2]
                 if horizontal_distance_to_current_goal_position < 1.0:
                     goal_position[2] -= 0.5
@@ -1434,6 +1435,17 @@ class DroneFlightController:
             and not bool(self.move_in_auto_mode)
             and reverse_speed <= STATIC_LOCK_MAX_REVERSE_SPEED
         )
+
+    def _can_enter_landing_mode(self, distance_to_goal: float) -> bool:
+        if float(distance_to_goal) >= 4.0:
+            return False
+        if self._xgb_map_is({"village"}):
+            prob = float(getattr(self, "_last_goal_visibility_prob", 0.0) or 0.0)
+            return bool(
+                self._goal_is_tracked
+                and prob > VILLAGE_LANDING_MIN_PROBABILITY
+            )
+        return bool(self.is_find_P)
 
     def _can_enter_goal_return_mode(self):
         if self._xgb_map_is({"village"}):

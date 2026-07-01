@@ -415,6 +415,28 @@ class MovingDroneAviary(BaseRLAviary):
                 physicsClientId=cli
             )
 
+    def _drone_onboard_camera_pose(
+        self,
+        nth_drone: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Current onboard camera eye, target, and up from live PyBullet pose."""
+        cli = getattr(self, "CLIENT", 0)
+        pos, quat = p.getBasePositionAndOrientation(
+            self.DRONE_IDS[nth_drone],
+            physicsClientId=cli,
+        )
+        pos = np.asarray(pos, dtype=float)
+        rot_mat = np.array(p.getMatrixFromQuaternion(quat)).reshape(3, 3)
+
+        forward = rot_mat @ np.array([1.0, 0.0, 0.0])
+        forward = forward / np.linalg.norm(forward)
+        up = rot_mat @ np.array([0.0, 0.0, 1.0])
+
+        camera_offset = 0.13
+        camera_pos = pos + forward * camera_offset + up * 0.05
+        target = camera_pos + forward * 20.0
+        return camera_pos, target, up
+
     def _getDroneImages(self, nth_drone, segmentation: bool = False):
         """Get camera images from drone. Returns (rgb, depth, seg) but we only use depth."""
         if self.OBS_TYPE != ObservationType.RGB:
@@ -425,17 +447,7 @@ class MovingDroneAviary(BaseRLAviary):
             exit()
         
         cli = getattr(self, "CLIENT", 0)
-        drone_pos = self.pos[nth_drone, :]
-        rot_mat = np.array(p.getMatrixFromQuaternion(self.quat[nth_drone, :])).reshape(3, 3)
-        
-        forward = rot_mat @ np.array([1.0, 0.0, 0.0])
-        forward = forward / np.linalg.norm(forward)
-        up = rot_mat @ np.array([0.0, 0.0, 1.0])
-        
-        camera_offset = 0.13
-        camera_pos = drone_pos + forward * camera_offset + up * 0.05
-        
-        target = camera_pos + forward * 20.0
+        camera_pos, target, up = self._drone_onboard_camera_pose(nth_drone)
         
         DRONE_CAM_VIEW = p.computeViewMatrix(
             cameraEyePosition=camera_pos,
@@ -474,6 +486,49 @@ class MovingDroneAviary(BaseRLAviary):
         
         dep = np.reshape(dep, (h, w))
         return None, dep, None
+
+    def capture_drone_camera_preview(
+        self,
+        nth_drone: int = 0,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Render live RGB and normalized depth from the onboard drone camera."""
+        if self.IMG_RES is None:
+            raise RuntimeError("IMG_RES not set")
+        cli = getattr(self, "CLIENT", 0)
+        camera_pos, target, up = self._drone_onboard_camera_pose(nth_drone)
+
+        view = p.computeViewMatrix(
+            cameraEyePosition=camera_pos,
+            cameraTargetPosition=target,
+            cameraUpVector=up.tolist(),
+            physicsClientId=cli,
+        )
+        if self._cached_proj_matrix is None:
+            aspect = self.IMG_RES[0] / self.IMG_RES[1]
+            self._cached_proj_matrix = p.computeProjectionMatrixFOV(
+                fov=self._fov,
+                aspect=aspect,
+                nearVal=0.05,
+                farVal=DEPTH_FAR,
+                physicsClientId=cli,
+            )
+
+        _w, _h, rgba, dep, _seg = p.getCameraImage(
+            width=self.IMG_RES[0],
+            height=self.IMG_RES[1],
+            shadow=0,
+            renderer=p.ER_TINY_RENDERER,
+            viewMatrix=view,
+            projectionMatrix=self._cached_proj_matrix,
+            lightDirection=self._light_direction,
+            flags=p.ER_NO_SEGMENTATION_MASK,
+            physicsClientId=cli,
+        )
+        h = int(self.IMG_RES[1])
+        w = int(self.IMG_RES[0])
+        rgb = np.asarray(rgba, dtype=np.uint8).reshape(h, w, 4)[:, :, :3].copy()
+        depth = self._process_depth(np.reshape(dep, (h, w))).copy()
+        return rgb, depth
 
     def _get_altitude_distance(self) -> float:
         """Cast single ray downward for ground/altitude detection."""

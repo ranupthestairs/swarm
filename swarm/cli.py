@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from swarm.constants import N_DOCKER_WORKERS
+from swarm.core.fly_viewer import DEFAULT_VIEW_HEIGHT, DEFAULT_VIEW_WIDTH
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BENCH_LOG = Path("/tmp/bench_full_eval.log")
@@ -751,9 +752,9 @@ def _build_fly_argv(args: argparse.Namespace) -> list[str]:
         argv.extend(["--debug-every", str(args.debug_every)])
     if getattr(args, "camera", "chase") != "chase":
         argv.extend(["--camera", str(args.camera)])
-    if getattr(args, "width", None) not in (None, 960):
+    if getattr(args, "width", None) not in (None, DEFAULT_VIEW_WIDTH):
         argv.extend(["--width", str(args.width)])
-    if getattr(args, "height", None) not in (None, 540):
+    if getattr(args, "height", None) not in (None, DEFAULT_VIEW_HEIGHT):
         argv.extend(["--height", str(args.height)])
     if getattr(args, "video_out", None) is not None:
         argv.extend(["--video-out", str(args.video_out)])
@@ -1552,14 +1553,14 @@ def build_parser() -> argparse.ArgumentParser:
     fly_parser.add_argument(
         "--width",
         type=int,
-        default=960,
-        help="3D viewport width in pixels.",
+        default=DEFAULT_VIEW_WIDTH,
+        help=f"3D viewport width in pixels (default: {DEFAULT_VIEW_WIDTH}).",
     )
     fly_parser.add_argument(
         "--height",
         type=int,
-        default=540,
-        help="3D viewport height in pixels.",
+        default=DEFAULT_VIEW_HEIGHT,
+        help=f"3D viewport height in pixels (default: {DEFAULT_VIEW_HEIGHT}).",
     )
     fly_parser.add_argument(
         "--video-out",

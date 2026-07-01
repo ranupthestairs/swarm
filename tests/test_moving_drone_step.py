@@ -64,3 +64,33 @@ def test_step_runs_collision_bookkeeping_after_physics(monkeypatch) -> None:
 
     assert order.index("step_sim") < order.index("collision_check")
     assert abs(env._time_alive - (1.0 / env.CTRL_FREQ)) < 1e-9
+
+
+def test_drone_onboard_camera_pose_uses_live_pybullet_pose(monkeypatch) -> None:
+    env = moving_drone_mod.MovingDroneAviary.__new__(moving_drone_mod.MovingDroneAviary)
+    env.CLIENT = 7
+    env.DRONE_IDS = [42]
+    poses = [
+        ([0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]),
+        ([5.0, 0.0, 1.0], [0.0, 0.0, 0.7071068, 0.7071068]),
+    ]
+    state = {"index": 0}
+
+    def _get_pose(*_args, **_kwargs):
+        return poses[state["index"]]
+
+    monkeypatch.setattr(
+        moving_drone_mod.p,
+        "getBasePositionAndOrientation",
+        _get_pose,
+    )
+    monkeypatch.setattr(
+        moving_drone_mod.p,
+        "getMatrixFromQuaternion",
+        lambda quat: np.eye(3, dtype=float).reshape(-1),
+    )
+
+    eye_a, _, _ = env._drone_onboard_camera_pose(0)
+    state["index"] = 1
+    eye_b, _, _ = env._drone_onboard_camera_pose(0)
+    assert float(np.linalg.norm(eye_b - eye_a)) > 1.0

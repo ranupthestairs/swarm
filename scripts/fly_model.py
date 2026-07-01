@@ -232,6 +232,25 @@ def _parse_observation(obs: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _capture_drone_camera_frames(
+    env,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Live onboard RGB + colourised depth for the fly UI preview."""
+    from swarm.core.fly_viewer import colourise_depth_normalized
+
+    capture = getattr(env, "capture_drone_camera_preview", None)
+    if not callable(capture):
+        return None, None
+    try:
+        rgb, depth = capture(0)
+        return (
+            np.asarray(rgb, dtype=np.uint8).copy(),
+            colourise_depth_normalized(depth),
+        )
+    except Exception:
+        return None, None
+
+
 def _snapshot_agent_debug(agent: Any) -> dict[str, Any]:
     if hasattr(agent, "get_debug_info") and callable(agent.get_debug_info):
         try:
@@ -339,6 +358,9 @@ def _set_drone_pose(
         np.asarray(quaternion, dtype=float).tolist(),
         physicsClientId=cli,
     )
+    sync_pose = getattr(env, "_updateAndStoreKinematicInformation", None)
+    if callable(sync_pose):
+        sync_pose()
 
 
 def _capture_trajectory_frame(
@@ -651,6 +673,8 @@ def fly_episode(
     obs_info = None
     agent_info = None
     obs = None
+    drone_cam_rgb: np.ndarray | None = None
+    depth_rgb: np.ndarray | None = None
 
     sim_state = "config"
     t_sim = 0.0
@@ -905,6 +929,8 @@ def fly_episode(
 
             now = time.perf_counter()
             frame_rgb = None
+            drone_cam_rgb = None
+            depth_rgb = None
             if env is not None and task is not None:
                 if sim_state == "running" and lo is not None and hi is not None:
                     if now - last_step_at >= SIM_DT:
@@ -1026,6 +1052,7 @@ def fly_episode(
                     height=view_height,
                     dt=SIM_DT,
                 )
+                drone_cam_rgb, depth_rgb = _capture_drone_camera_frames(env)
                 if sim_state == "running":
                     recorded_frames.append(frame_rgb.copy())
 
@@ -1066,6 +1093,8 @@ def fly_episode(
                 bottom_lines,
                 placeholder_text=placeholder,
                 replay_ui=replay_ui,
+                drone_cam_rgb=drone_cam_rgb,
+                depth_rgb=depth_rgb,
             )
 
             if realtime and sim_state in {"running", "replay"}:
