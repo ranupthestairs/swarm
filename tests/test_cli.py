@@ -455,6 +455,24 @@ def test_fly_rejects_batch_with_seed(tmp_path, capsys):
     assert "--seed or --type with --batch" in capsys.readouterr().err
 
 
+def test_fly_rejects_missing_batch_file(tmp_path, capsys):
+    source_dir = tmp_path / "my_agent"
+    source_dir.mkdir()
+
+    rc = cli.main(
+        [
+            "fly",
+            "--source",
+            str(source_dir),
+            "--batch",
+            str(tmp_path / "missing.json"),
+        ]
+    )
+
+    assert rc == 1
+    assert "Batch file not found" in capsys.readouterr().err
+
+
 def test_fly_invokes_source_directory(monkeypatch, tmp_path):
     source_dir = tmp_path / "my_agent"
     source_dir.mkdir()

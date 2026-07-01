@@ -771,8 +771,15 @@ def _cmd_fly(args: argparse.Namespace) -> int:
         if args.seed is not None or args.type is not None:
             print("Do not pass --seed or --type with --batch; use the JSON file.", file=sys.stderr)
             return 1
+        if getattr(args, "no_setup", False):
+            print("Do not use --no-setup with --batch.", file=sys.stderr)
+            return 1
         if args.model is None and getattr(args, "source", None) is None:
             print("Batch mode requires --model or --source.", file=sys.stderr)
+            return 1
+        batch_path = Path(args.batch).expanduser()
+        if not batch_path.is_file():
+            print(f"Batch file not found: {batch_path}", file=sys.stderr)
             return 1
 
     if args.model is not None:
@@ -1566,7 +1573,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "JSON file with map types and seeds. Runs headlessly without the viewer "
-            "and saves trajectories to fly_runs/."
+            "and saves trajectories to fly_runs/. "
+            "Example: {\"type1_city\": [1001, 1002], \"type2_open\": [2001]} "
+            "or [{\"type\": 1, \"seeds\": [1001]}]."
         ),
     )
     fly_parser.set_defaults(func=_cmd_fly)

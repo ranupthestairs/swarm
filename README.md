@@ -191,10 +191,10 @@ swarm fly --source miners/champion_UID_191/ --seed 1001 --type 1 --debug
 swarm fly --source miners/champion_UID_191/ --seed 1001 --type 1 --fast --debug --debug-every 10
 
 # Batch headless runs from a JSON seed file (no viewer; saves to fly_runs/)
-swarm fly --source miners/champion_UID_191/ --batch my_seeds.json
+swarm fly --source miners/champion_UID_191/ --batch fly_batch_example.json
 ```
 
-Batch JSON example (`my_seeds.json`):
+Batch JSON example (`fly_batch_example.json` in the repo root):
 
 ```json
 {

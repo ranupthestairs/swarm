@@ -1124,6 +1124,8 @@ def _resolve_batch_launch_config(args: argparse.Namespace) -> FlyLaunchConfig:
         raise ValueError("Batch mode requires --model or --source.")
     if args.seed is not None or args.type is not None:
         raise ValueError("Do not pass --seed or --type with --batch; use the JSON file.")
+    if getattr(args, "no_setup", False):
+        raise ValueError("Do not use --no-setup with --batch.")
     agent_path = args.source if args.source is not None else args.model
     assert agent_path is not None
     kind = "source" if args.source is not None else "zip"
@@ -1160,7 +1162,8 @@ def run_batch_mode(args: argparse.Namespace) -> int:
     )
     print_batch_summary(results)
     failures = sum(1 for item in results if not item.get("success"))
-    return 0 if failures == 0 else 1
+    errors = sum(1 for item in results if item.get("error"))
+    return 0 if failures == 0 and errors == 0 else 1
 
 
 def main(argv: list[str] | None = None) -> int:

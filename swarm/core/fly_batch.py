@@ -53,6 +53,9 @@ TYPE_LABELS = {
 }
 _LABEL_TO_TYPE = {label: challenge_type for challenge_type, label in TYPE_LABELS.items()}
 _TYPE_PREFIX_RE = re.compile(r"^type(\d)(?:_|$)", re.IGNORECASE)
+_MAPPING_META_KEYS = frozenset(
+    {"runs", "comment", "description", "version", "name", "note", "notes", "title"}
+)
 
 
 @dataclass(frozen=True)
@@ -92,6 +95,8 @@ def _jobs_from_mapping(raw: dict[str, Any]) -> list[FlyBatchJob]:
     ordered_keys = [key for key in BENCH_GROUP_ORDER if key in raw]
     ordered_keys.extend(sorted(key for key in raw if key not in BENCH_GROUP_ORDER))
     for key in ordered_keys:
+        if key in _MAPPING_META_KEYS:
+            continue
         seeds = raw.get(key)
         if seeds in (None, []):
             continue
@@ -99,7 +104,10 @@ def _jobs_from_mapping(raw: dict[str, Any]) -> list[FlyBatchJob]:
             raise ValueError(f"Seed group {key!r} must be a list when present.")
         challenge_type = _challenge_type_from_key(key)
         if challenge_type is None:
-            raise ValueError(f"Unrecognized map type key: {key!r}")
+            raise ValueError(
+                f"Unrecognized map type key {key!r}. "
+                "Use type1_city..type6_forest, numeric type ids (1-6), or map labels like city."
+            )
         for seed in seeds:
             jobs.append(
                 FlyBatchJob(
@@ -134,13 +142,19 @@ def _jobs_from_list(raw: list[Any]) -> list[FlyBatchJob]:
 def load_batch_jobs(seed_file: Path) -> list[FlyBatchJob]:
     """Load (challenge_type, seed) jobs from a JSON file."""
     path = Path(seed_file).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"Batch file not found: {path}")
     raw = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(raw, dict) and "runs" in raw and isinstance(raw["runs"], list):
-        jobs = _jobs_from_list(raw["runs"])
+    jobs: list[FlyBatchJob] = []
+    if isinstance(raw, dict):
+        runs = raw.get("runs")
+        if isinstance(runs, list):
+            jobs.extend(_jobs_from_list(runs))
+        mapping = {key: value for key, value in raw.items() if key != "runs"}
+        if mapping:
+            jobs.extend(_jobs_from_mapping(mapping))
     elif isinstance(raw, list):
-        jobs = _jobs_from_list(raw)
-    elif isinstance(raw, dict):
-        jobs = _jobs_from_mapping(raw)
+        jobs.extend(_jobs_from_list(raw))
     else:
         raise ValueError("Batch file must be a JSON object or list.")
     if not jobs:
@@ -333,15 +347,30 @@ def run_batch(
                 f"seed{job.seed} ...",
                 flush=True,
             )
-            outcome = run_headless_episode(
-                launch=job_launch,
-                repo_root=repo_root,
-                agent=agent,
-                lo=lo,
-                hi=hi,
-                debug=debug,
-                debug_every=debug_every,
-            )
+            try:
+                outcome = run_headless_episode(
+                    launch=job_launch,
+                    repo_root=repo_root,
+                    agent=agent,
+                    lo=lo,
+                    hi=hi,
+                    debug=debug,
+                    debug_every=debug_every,
+                )
+            except Exception as exc:
+                print(f"    ERROR  {exc}", file=sys.stderr)
+                results.append(
+                    {
+                        "path": None,
+                        "result": {"score": 0.0},
+                        "seed": int(job.seed),
+                        "challenge_type": int(job.challenge_type),
+                        "type_label": job.type_label,
+                        "success": False,
+                        "error": str(exc),
+                    }
+                )
+                continue
             summary = format_score_summary(outcome["result"]) or ""
             status = "success" if outcome["success"] else "failed"
             print(
@@ -361,6 +390,7 @@ def print_batch_summary(results: Sequence[dict[str, Any]]) -> None:
         print("No batch runs completed.")
         return
     successes = sum(1 for item in results if item.get("success"))
+    errors = sum(1 for item in results if item.get("error"))
     scores = [float(item["result"]["score"]) for item in results if item.get("result")]
     avg_score = sum(scores) / len(scores) if scores else 0.0
     print("\n" + "=" * 60)
@@ -368,6 +398,8 @@ def print_batch_summary(results: Sequence[dict[str, Any]]) -> None:
     print("=" * 60)
     print(f"Runs       : {len(results)}")
     print(f"Successes  : {successes}/{len(results)}")
+    if errors:
+        print(f"Errors     : {errors}")
     print(f"Avg score  : {avg_score:.3f}")
     print("Saved under fly_runs/ — open them later with `swarm fly` → Open Run.")
     print("=" * 60)
