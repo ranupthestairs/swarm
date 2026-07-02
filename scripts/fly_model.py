@@ -218,6 +218,18 @@ def _prepare_agent_dir(
     )
 
 
+def _replay_step_interval_and_stride(replay_speed: float) -> tuple[float, int]:
+    """Wall-clock interval between replay steps and how many frames to advance."""
+    speed = max(0.1, float(replay_speed))
+    if speed >= 8.0 - 1e-6:
+        return SIM_DT, 8
+    if speed >= 4.0 - 1e-6:
+        return SIM_DT, 4
+    if speed >= 2.0 - 1e-6:
+        return SIM_DT, 2
+    return SIM_DT / speed, 1
+
+
 def _parse_observation(obs: dict[str, Any]) -> dict[str, Any]:
     state = np.asarray(obs["state"], dtype=np.float32)
     position = state[0:3]
@@ -720,8 +732,18 @@ def fly_episode(
             if ui.load_run_path:
                 try:
                     last_trajectory = _load_run_for_replay(ui.load_run_path)
+                    window.apply_loaded_trajectory(last_trajectory)
                     window.set_replay_enabled(True)
                     window.refresh_saved_runs()
+                    frame_count = len(last_trajectory.frames)
+                    duration = last_trajectory.duration_sec
+                    window.set_status(
+                        f"Loaded {frame_count} frames ({duration:.1f}s). Press Replay."
+                    )
+                    print(
+                        f"Loaded trajectory: {ui.load_run_path} "
+                        f"({frame_count} frames, {duration:.1f}s)"
+                    )
                 except Exception as exc:
                     window.set_status(f"Failed to load run: {exc}")
                     print(f"Failed to load run: {exc}", file=sys.stderr)
@@ -731,6 +753,7 @@ def fly_episode(
                 window.replay_speed = replay_speed
 
             if ui.replay_seek is not None and last_trajectory is not None and env is not None:
+                was_playing = sim_state == "replay"
                 seek = max(0, min(int(ui.replay_seek), len(last_trajectory.frames) - 1))
                 obs_info, agent_info, last_action, t_sim, step_count = _apply_replay_at_index(
                     env,
@@ -738,9 +761,9 @@ def fly_episode(
                     seek,
                 )
                 replay_index = seek + 1
-                if sim_state in {"replay", "replay_paused"}:
-                    sim_state = "replay_paused"
-                    window.set_status(f"Replay at {t_sim:.1f}s (paused).")
+                if was_playing:
+                    sim_state = "replay"
+                    last_step_at = time.perf_counter()
 
             if ui.build_map or (launch is not None and env is None):
                 launch_cfg = window.get_launch_config()
@@ -1026,18 +1049,23 @@ def fly_episode(
                 elif (
                     sim_state == "replay"
                     and last_trajectory is not None
-                    and now - last_step_at >= SIM_DT / max(replay_speed, 0.1)
                 ):
-                    if replay_index < len(last_trajectory.frames):
-                        obs_info, agent_info, last_action, t_sim, step_count = (
-                            _apply_replay_at_index(env, last_trajectory, replay_index)
-                        )
-                        replay_index += 1
-                        last_step_at = now
-                        if replay_index >= len(last_trajectory.frames):
-                            sim_state = "replay_finished"
-                            window.set_replay_ui_active(False)
-                            window.set_status("Replay finished. Open another run or Replay again.")
+                    replay_interval, replay_stride = _replay_step_interval_and_stride(
+                        replay_speed
+                    )
+                    if now - last_step_at >= replay_interval:
+                        if replay_index < len(last_trajectory.frames):
+                            obs_info, agent_info, last_action, t_sim, step_count = (
+                                _apply_replay_at_index(env, last_trajectory, replay_index)
+                            )
+                            replay_index += replay_stride
+                            last_step_at = now
+                            if replay_index >= len(last_trajectory.frames):
+                                sim_state = "replay_finished"
+                                window.set_replay_ui_active(False)
+                                window.set_status(
+                                    "Replay finished. Open another run or Replay again."
+                                )
                 elif task.moving_platform and sim_state in {"ready", "paused"} and now - last_preview_step_at >= SIM_DT:
                     import pybullet as p
 
@@ -1098,7 +1126,10 @@ def fly_episode(
             )
 
             if realtime and sim_state in {"running", "replay"}:
-                pace = SIM_DT if sim_state == "running" else SIM_DT / max(replay_speed, 0.1)
+                if sim_state == "running":
+                    pace = SIM_DT
+                else:
+                    pace, _ = _replay_step_interval_and_stride(replay_speed)
                 time.sleep(max(0.0, pace - (time.perf_counter() - now)))
             else:
                 time.sleep(0.02)

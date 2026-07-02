@@ -155,3 +155,25 @@ def test_link_workspace_skips_when_no_onnx(tmp_path: Path) -> None:
     (extracted / "drone_agent.py").write_text("class DroneFlightController: pass\n")
 
     video_mod._link_workspace(extracted)
+
+
+def test_load_agent_registers_module_for_dataclasses(tmp_path: Path) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    (agent_dir / "drone_agent.py").write_text(
+        """from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class _Cfg:
+    value: int = 1
+
+class DroneFlightController:
+    def reset(self):
+        return None
+
+    def act(self, obs):
+        return None
+"""
+    )
+    agent = video_mod._load_agent(agent_dir)
+    assert agent is not None

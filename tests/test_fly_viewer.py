@@ -78,12 +78,11 @@ def test_goal_detection_lines_show_pad_estimate_errors() -> None:
 
 
 def test_left_panel_min_height_fits_controls() -> None:
-    from swarm.core.fly_viewer import compute_left_panel_min_height
+    from swarm.core.fly_viewer import Y_CAMERA, compute_left_panel_min_height
 
     btn_h = 26
     gap = 6
-    y_cam = 586
-    zoom_row_bottom = y_cam + 2 * (btn_h + gap) + btn_h
+    zoom_row_bottom = Y_CAMERA + 2 * (btn_h + gap) + btn_h
     assert LEFT_PANEL_MIN_HEIGHT >= zoom_row_bottom + 12
     assert compute_left_panel_min_height() == LEFT_PANEL_MIN_HEIGHT
 
@@ -166,3 +165,31 @@ def test_camera_mode_switch_resets_smoothing() -> None:
     camera.mode = "fpv"
     camera.eye_and_target(pos, (0.0, 0.0, 0.0, 1.0), dt=0.02)
     assert camera._smoothing_mode == "fpv"
+
+
+def test_saved_runs_scrollbar_helpers() -> None:
+    from pathlib import Path
+
+    from swarm.core.fly_trajectory import SavedRunInfo
+    from swarm.core.fly_viewer import SAVED_RUN_VISIBLE_ROWS, FlySimulatorWindow
+
+    class _FakeWindow(FlySimulatorWindow):
+        def __init__(self) -> None:
+            self.saved_runs = [
+                SavedRunInfo(
+                    path=Path(f"/tmp/run_{idx}.json"),
+                    display_name=f"run_{idx}",
+                )
+                for idx in range(10)
+            ]
+            self.run_scroll = 0
+
+    window = _FakeWindow()
+    assert window._saved_runs_max_scroll() == 10 - SAVED_RUN_VISIBLE_ROWS
+    window.run_scroll = window._saved_runs_max_scroll()
+    thumb_top = window._saved_runs_scrollbar_thumb_rect()[1]
+    track_top = window._saved_runs_scrollbar_track_rect()[1]
+    assert thumb_top >= track_top
+    assert window._scroll_from_scrollbar_y(track_top) == 0
+    track_bottom = track_top + window._saved_runs_scrollbar_track_rect()[3]
+    assert window._scroll_from_scrollbar_y(track_bottom) == window._saved_runs_max_scroll()

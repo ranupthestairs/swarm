@@ -553,6 +553,7 @@ def _load_agent(extracted: Path):
         if spec is None or spec.loader is None:
             raise RuntimeError("Could not load drone_agent.py from submission")
         mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
         spec.loader.exec_module(mod)
         agent = mod.DroneFlightController()
         for init_method in ("_ensure_loaded", "reset"):

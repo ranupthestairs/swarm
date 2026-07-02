@@ -27,7 +27,7 @@ BOTTOM_PANEL_HEIGHT = 228
 REPLAY_BAR_HEIGHT = 58
 REPLAY_BAR_MARGIN = 12
 LEFT_PANEL_BOTTOM_PADDING = 24
-REPLAY_SPEED_CHOICES: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
+REPLAY_SPEED_CHOICES: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0, 8.0)
 # Default fly viewport (16:9). Lower than 960x540 for faster CPU rendering; override with --width/--height.
 DEFAULT_VIEW_WIDTH = 640
 DEFAULT_VIEW_HEIGHT = 360
@@ -48,13 +48,30 @@ FPV_OFFSET_UP_M = 0.02
 FPV_SMOOTHING = 0.85
 OVERVIEW_ORBIT_DEG_SEC = 5.0
 
+SAVED_RUN_ROW_HEIGHT = 30
+SAVED_RUN_VISIBLE_ROWS = 6
+SAVED_RUN_SCROLLBAR_WIDTH = 10
+MAP_TYPE_BOX_HEIGHT = 26
+MAP_TYPE_OPTION_HEIGHT = 24
+
+Y_MAP_LABEL = 202
+Y_MAP_BOX = 222
+Y_RUNS_LABEL = 258
+Y_RUNS_TOP = 276
+Y_SIMULATION_LABEL = 464
+Y_BUILD = 474
+Y_CTRL = 504
+Y_REPLAY_ROW = 534
+Y_EXPORT = 564
+Y_CAMERA_LABEL = 590
+Y_CAMERA = 614
+
 
 def compute_left_panel_min_height() -> int:
     """Minimum left-panel height so every control row is clickable."""
     btn_h = 26
     gap = 6
-    y_cam = 586
-    zoom_row_bottom = y_cam + 2 * (btn_h + gap) + btn_h
+    zoom_row_bottom = Y_CAMERA + 2 * (btn_h + gap) + btn_h
     return zoom_row_bottom + LEFT_PANEL_BOTTOM_PADDING
 
 
@@ -587,6 +604,8 @@ class FlySimulatorWindow:
         self.replay_speed = 1.0
         self._replay_ui_active = False
         self._timeline_dragging = False
+        self._map_type_open = False
+        self._run_scrollbar_dragging = False
         self._buttons: list[_Button] = []
         self.left_panel_height = max(self.view_height, LEFT_PANEL_MIN_HEIGHT)
 
@@ -626,11 +645,80 @@ class FlySimulatorWindow:
         self._layout_buttons()
 
     def refresh_saved_runs(self) -> None:
-        self.saved_runs = list_saved_runs(self.repo_root, limit=50)
+        self.saved_runs = list_saved_runs(self.repo_root)
         self.run_scroll = max(
             0,
-            min(self.run_scroll, max(0, len(self.saved_runs) - 3)),
+            min(self.run_scroll, self._saved_runs_max_scroll()),
         )
+
+    def apply_loaded_trajectory(self, trajectory: Any) -> None:
+        """Sync launch controls from a loaded trajectory and close dropdowns."""
+        meta = getattr(trajectory, "meta", None) or {}
+        if "seed" in meta:
+            self.seed = max(1, int(meta["seed"]))
+            self.seed_text = str(self.seed)
+        if "challenge_type" in meta:
+            self.challenge_type = int(meta["challenge_type"])
+        self._map_type_open = False
+        self.seed_active = False
+        self.custom_active = False
+
+    def _saved_runs_max_scroll(self) -> int:
+        return max(0, len(self.saved_runs) - SAVED_RUN_VISIBLE_ROWS)
+
+    def _map_type_label(self, challenge_type: int) -> str:
+        for value, label in MAP_TYPE_CHOICES:
+            if value == challenge_type:
+                return label
+        return str(challenge_type)
+
+    def _map_type_box_rect(self) -> tuple[int, int, int, int]:
+        return (10, Y_MAP_BOX, PANEL_WIDTH - 20, MAP_TYPE_BOX_HEIGHT)
+
+    def _map_type_option_rect(self, option_index: int) -> tuple[int, int, int, int]:
+        box = self._map_type_box_rect()
+        return (
+            box[0],
+            box[1] + box[3] + 2 + option_index * MAP_TYPE_OPTION_HEIGHT,
+            box[2],
+            MAP_TYPE_OPTION_HEIGHT,
+        )
+
+    def _saved_runs_list_rect(self) -> tuple[int, int, int, int]:
+        height = SAVED_RUN_VISIBLE_ROWS * SAVED_RUN_ROW_HEIGHT
+        width = PANEL_WIDTH - 20 - SAVED_RUN_SCROLLBAR_WIDTH - 4
+        return (10, Y_RUNS_TOP, width, height)
+
+    def _saved_runs_scrollbar_track_rect(self) -> tuple[int, int, int, int]:
+        list_rect = self._saved_runs_list_rect()
+        return (
+            list_rect[0] + list_rect[2] + 4,
+            list_rect[1],
+            SAVED_RUN_SCROLLBAR_WIDTH,
+            list_rect[3],
+        )
+
+    def _saved_runs_scrollbar_thumb_rect(self) -> tuple[int, int, int, int]:
+        track = self._saved_runs_scrollbar_track_rect()
+        total = len(self.saved_runs)
+        if total <= SAVED_RUN_VISIBLE_ROWS:
+            return track
+        max_scroll = self._saved_runs_max_scroll()
+        thumb_h = max(24, int(track[3] * SAVED_RUN_VISIBLE_ROWS / total))
+        usable = max(1, track[3] - thumb_h)
+        thumb_y = track[1] + int(usable * self.run_scroll / max_scroll)
+        return (track[0], thumb_y, track[2], thumb_h)
+
+    def _scroll_from_scrollbar_y(self, y: int) -> int:
+        track = self._saved_runs_scrollbar_track_rect()
+        thumb = self._saved_runs_scrollbar_thumb_rect()
+        max_scroll = self._saved_runs_max_scroll()
+        if max_scroll <= 0:
+            return 0
+        usable = max(1, track[3] - thumb[3])
+        ratio = (y - track[1] - thumb[3] / 2) / usable
+        ratio = max(0.0, min(1.0, ratio))
+        return int(round(ratio * max_scroll))
 
     def set_replay_ui_active(self, active: bool) -> None:
         self._replay_ui_active = bool(active)
@@ -641,60 +729,39 @@ class FlySimulatorWindow:
         w_half = (w_full - 6) // 2
         gap = 6
         btn_h = 26
-        map_btn_h = 24
 
-        y_map = 222
-        y_build = 446
-        y_ctrl = 476
-        y_replay_row = 506
-        y_export = 536
-        y_cam = 586
-        self._camera_label_y = 562
-        self._runs_label_y = 310
-        self._run_rows_top = 328
-        self._simulation_label_y = 424
+        self._camera_label_y = Y_CAMERA_LABEL
+        self._runs_label_y = Y_RUNS_LABEL
+        self._run_rows_top = Y_RUNS_TOP
+        self._simulation_label_y = Y_SIMULATION_LABEL
 
         self._buttons = [
             _Button("open_dir", "Open Dir...", (x0, 128, 92, 28)),
-            _Button("build_map", "Build Map", (x0, y_build, w_full, btn_h)),
-            _Button("start", "Start", (x0, y_ctrl, w_half, btn_h)),
-            _Button("pause", "Pause", (x0 + w_half + gap, y_ctrl, w_half, btn_h)),
-            _Button("replay", "Replay", (x0, y_replay_row, w_half, btn_h)),
-            _Button("open_run", "Open Run", (x0 + w_half + gap, y_replay_row, w_half, btn_h)),
-            _Button("export", "Export", (x0, y_export, w_full, btn_h)),
-            _Button("cam_chase", "Chase", (x0, y_cam, w_half, btn_h)),
-            _Button("cam_fpv", "FPV", (x0 + w_half + gap, y_cam, w_half, btn_h)),
-            _Button("cam_top", "Top", (x0, y_cam + btn_h + gap, w_half, btn_h)),
+            _Button("build_map", "Build Map", (x0, Y_BUILD, w_full, btn_h)),
+            _Button("start", "Start", (x0, Y_CTRL, w_half, btn_h)),
+            _Button("pause", "Pause", (x0 + w_half + gap, Y_CTRL, w_half, btn_h)),
+            _Button("replay", "Replay", (x0, Y_REPLAY_ROW, w_half, btn_h)),
+            _Button("open_run", "Open Run", (x0 + w_half + gap, Y_REPLAY_ROW, w_half, btn_h)),
+            _Button("export", "Export", (x0, Y_EXPORT, w_full, btn_h)),
+            _Button("cam_chase", "Chase", (x0, Y_CAMERA, w_half, btn_h)),
+            _Button("cam_fpv", "FPV", (x0 + w_half + gap, Y_CAMERA, w_half, btn_h)),
+            _Button("cam_top", "Top", (x0, Y_CAMERA + btn_h + gap, w_half, btn_h)),
             _Button(
                 "cam_overview",
                 "Overview",
-                (x0 + w_half + gap, y_cam + btn_h + gap, w_half, btn_h),
+                (x0 + w_half + gap, Y_CAMERA + btn_h + gap, w_half, btn_h),
             ),
             _Button(
                 "zoom_in",
                 "Zoom +",
-                (x0, y_cam + 2 * (btn_h + gap), w_half, btn_h),
+                (x0, Y_CAMERA + 2 * (btn_h + gap), w_half, btn_h),
             ),
             _Button(
                 "zoom_out",
                 "Zoom -",
-                (x0 + w_half + gap, y_cam + 2 * (btn_h + gap), w_half, btn_h),
+                (x0 + w_half + gap, Y_CAMERA + 2 * (btn_h + gap), w_half, btn_h),
             ),
         ]
-        for idx, (challenge_type, label) in enumerate(MAP_TYPE_CHOICES):
-            row, col = divmod(idx, 2)
-            self._buttons.append(
-                _Button(
-                    f"type_{challenge_type}",
-                    label,
-                    (
-                        x0 + col * (w_half + gap),
-                        y_map + row * (map_btn_h + 4),
-                        w_half,
-                        map_btn_h,
-                    ),
-                )
-            )
 
     def set_status(self, message: str) -> None:
         self._status_message = message
@@ -721,7 +788,13 @@ class FlySimulatorWindow:
         return (56, 168, PANEL_WIDTH - 66, 26)
 
     def _run_row_rect(self, row_index: int) -> tuple[int, int, int, int]:
-        return (10, self._run_rows_top + row_index * 30, PANEL_WIDTH - 20, 28)
+        list_rect = self._saved_runs_list_rect()
+        return (
+            list_rect[0],
+            list_rect[1] + row_index * SAVED_RUN_ROW_HEIGHT,
+            list_rect[2],
+            SAVED_RUN_ROW_HEIGHT - 2,
+        )
 
     def _replay_bar_top(self) -> int:
         return self.left_panel_height - REPLAY_BAR_HEIGHT
@@ -875,6 +948,7 @@ class FlySimulatorWindow:
             self._commit_seed_text()
         self.seed_active = False
         self.custom_active = False
+        self._map_type_open = False
 
     def _resolve_agent_path(self) -> tuple[Path, str] | None:
         active = self._active_agent_display_path()
@@ -900,10 +974,20 @@ class FlySimulatorWindow:
     def _hit_test(self, pos: tuple[int, int]) -> str | None:
         x, y = pos
         if x < PANEL_WIDTH:
+            if self._map_type_open:
+                for idx, (challenge_type, _label) in enumerate(MAP_TYPE_CHOICES):
+                    rect = self._map_type_option_rect(idx)
+                    bx, by, bw, bh = rect
+                    if bx <= x <= bx + bw and by <= y <= by + bh:
+                        return f"map_type_option_{challenge_type}"
             for button in self._buttons:
                 bx, by, bw, bh = button.rect
                 if bx <= x <= bx + bw and by <= y <= by + bh:
                     return button.key
+            map_box = self._map_type_box_rect()
+            bx, by, bw, bh = map_box
+            if bx <= x <= bx + bw and by <= y <= by + bh:
+                return "map_type_box"
             rect = self._last_agent_row_rect()
             bx, by, bw, bh = rect
             if bx <= x <= bx + bw and by <= y <= by + bh:
@@ -916,7 +1000,15 @@ class FlySimulatorWindow:
             bx, by, bw, bh = seed_field
             if bx <= x <= bx + bw and by <= y <= by + bh:
                 return "seed_field"
-            for row in range(3):
+            track = self._saved_runs_scrollbar_track_rect()
+            bx, by, bw, bh = track
+            if (
+                bx <= x <= bx + bw
+                and by <= y <= by + bh
+                and len(self.saved_runs) > SAVED_RUN_VISIBLE_ROWS
+            ):
+                return "run_scrollbar"
+            for row in range(SAVED_RUN_VISIBLE_ROWS):
                 rect = self._run_row_rect(row)
                 bx, by, bw, bh = rect
                 if bx <= x <= bx + bw and by <= y <= by + bh:
@@ -964,12 +1056,26 @@ class FlySimulatorWindow:
                         if self.seed_active:
                             self._commit_seed_text()
                         self.seed_active = False
+                        self._map_type_open = False
                         self.custom_active = True
                         self.use_last_agent = False
                     elif key == "seed_field":
                         if self.custom_active:
                             self.custom_active = False
+                        self._map_type_open = False
                         self.seed_active = True
+                    elif key == "map_type_box":
+                        if self.seed_active:
+                            self._commit_seed_text()
+                        self.seed_active = False
+                        self.custom_active = False
+                        self._map_type_open = not self._map_type_open
+                    elif key and key.startswith("map_type_option_"):
+                        self.challenge_type = int(key.split("_", 3)[3])
+                        self._map_type_open = False
+                    elif key == "run_scrollbar":
+                        self._run_scrollbar_dragging = True
+                        self.run_scroll = self._scroll_from_scrollbar_y(pg_event.pos[1])
                     elif key == "last_agent" and self.last_agent_path:
                         self._deactivate_inputs()
                         self.use_last_agent = True
@@ -1009,12 +1115,16 @@ class FlySimulatorWindow:
                         else:
                             self.set_status("Run selection cancelled.")
                     elif key and key.startswith("run_"):
-                        run_index = int(key.split("_", 1)[1])
-                        if 0 <= run_index < len(self.saved_runs):
-                            picked = str(self.saved_runs[run_index].path)
-                            event.load_run_path = picked
-                            self.selected_run_path = picked
-                            self.set_status(f"Loaded run: {self.saved_runs[run_index].display_name}")
+                        suffix = key.split("_", 1)[1]
+                        if suffix.isdigit():
+                            run_index = int(suffix)
+                            if 0 <= run_index < len(self.saved_runs):
+                                picked = str(self.saved_runs[run_index].path)
+                                event.load_run_path = picked
+                                self.selected_run_path = picked
+                                self.set_status(
+                                    f"Loaded run: {self.saved_runs[run_index].display_name}"
+                                )
                     elif key == "replay_timeline":
                         self._timeline_dragging = True
                         if self._replay_ui_active:
@@ -1038,22 +1148,31 @@ class FlySimulatorWindow:
                         event.zoom_in = True
                     elif key == "zoom_out":
                         event.zoom_out = True
-                    elif key and key.startswith("type_"):
-                        self.challenge_type = int(key.split("_", 1)[1])
                 elif pg_event.button == 4 and pg_event.pos[0] < PANEL_WIDTH:
-                    if pg_event.pos[1] >= self._run_rows_top:
+                    list_rect = self._saved_runs_list_rect()
+                    if (
+                        list_rect[1] <= pg_event.pos[1] <= list_rect[1] + list_rect[3]
+                        and self._saved_runs_max_scroll() > 0
+                    ):
                         self.run_scroll = max(0, self.run_scroll - 1)
                 elif pg_event.button == 5 and pg_event.pos[0] < PANEL_WIDTH:
-                    if pg_event.pos[1] >= self._run_rows_top:
+                    list_rect = self._saved_runs_list_rect()
+                    if (
+                        list_rect[1] <= pg_event.pos[1] <= list_rect[1] + list_rect[3]
+                        and self._saved_runs_max_scroll() > 0
+                    ):
                         self.run_scroll = min(
-                            max(0, len(self.saved_runs) - 3),
+                            self._saved_runs_max_scroll(),
                             self.run_scroll + 1,
                         )
             elif pg_event.type == pygame.MOUSEBUTTONUP:
                 if pg_event.button == 1:
                     self._timeline_dragging = False
+                    self._run_scrollbar_dragging = False
             elif pg_event.type == pygame.MOUSEMOTION:
-                if self._timeline_dragging and self._replay_ui_active:
+                if self._run_scrollbar_dragging:
+                    self.run_scroll = self._scroll_from_scrollbar_y(pg_event.pos[1])
+                elif self._timeline_dragging and self._replay_ui_active:
                     total = getattr(self, "_replay_total_frames", 1)
                     seek = self._timeline_frame_at_pos(pg_event.pos, total)
                     if seek is not None:
@@ -1143,9 +1262,33 @@ class FlySimulatorWindow:
             self._font_small.render(seed_display, True, (220, 220, 220)),
             (seed_field[0] + 6, seed_field[1] + 5),
         )
-        self.screen.blit(self._font.render("Map type", True, (210, 210, 210)), (12, 202))
+        self.screen.blit(self._font.render("Map type", True, (210, 210, 210)), (12, Y_MAP_LABEL))
+        map_box = self._map_type_box_rect()
+        pygame.draw.rect(
+            self.screen,
+            (48, 48, 58) if self._map_type_open else (34, 34, 38),
+            map_box,
+            border_radius=4,
+        )
+        pygame.draw.rect(self.screen, (90, 90, 95), map_box, width=1, border_radius=4)
+        map_label = self._map_type_label(self.challenge_type)
+        self.screen.blit(
+            self._font_small.render(map_label, True, (230, 230, 230)),
+            (map_box[0] + 8, map_box[1] + 6),
+        )
+        arrow = self._font_small.render("v" if self._map_type_open else ">", True, (180, 180, 185))
+        self.screen.blit(arrow, (map_box[0] + map_box[2] - 16, map_box[1] + 6))
+
         self.screen.blit(self._font.render("Saved runs", True, (210, 210, 210)), (12, self._runs_label_y))
-        for row in range(3):
+        list_rect = self._saved_runs_list_rect()
+        pygame.draw.rect(
+            self.screen,
+            (28, 28, 32),
+            list_rect,
+            border_radius=4,
+        )
+        pygame.draw.rect(self.screen, (55, 55, 60), list_rect, width=1, border_radius=4)
+        for row in range(SAVED_RUN_VISIBLE_ROWS):
             index = self.run_scroll + row
             if index >= len(self.saved_runs):
                 break
@@ -1177,6 +1320,36 @@ class FlySimulatorWindow:
                     (rect[0] + 6, rect[1] + 15),
                 )
 
+        if len(self.saved_runs) > SAVED_RUN_VISIBLE_ROWS:
+            track = self._saved_runs_scrollbar_track_rect()
+            thumb = self._saved_runs_scrollbar_thumb_rect()
+            pygame.draw.rect(self.screen, (40, 40, 48), track, border_radius=4)
+            pygame.draw.rect(self.screen, (90, 90, 95), track, width=1, border_radius=4)
+            pygame.draw.rect(self.screen, (110, 110, 118), thumb, border_radius=4)
+            pygame.draw.rect(self.screen, (140, 140, 148), thumb, width=1, border_radius=4)
+
+        if self._map_type_open:
+            for idx, (challenge_type, label) in enumerate(MAP_TYPE_CHOICES):
+                option_rect = self._map_type_option_rect(idx)
+                selected = challenge_type == self.challenge_type
+                pygame.draw.rect(
+                    self.screen,
+                    (46, 125, 50) if selected else (42, 42, 48),
+                    option_rect,
+                    border_radius=4,
+                )
+                pygame.draw.rect(
+                    self.screen,
+                    (90, 90, 95),
+                    option_rect,
+                    width=1,
+                    border_radius=4,
+                )
+                self.screen.blit(
+                    self._font_small.render(label, True, (230, 230, 230)),
+                    (option_rect[0] + 8, option_rect[1] + 5),
+                )
+
         self.screen.blit(self._font.render("Simulation", True, (210, 210, 210)), (12, self._simulation_label_y))
         self.screen.blit(self._font.render("Camera", True, (210, 210, 210)), (12, self._camera_label_y))
 
@@ -1200,8 +1373,6 @@ class FlySimulatorWindow:
                     "replay_paused",
                 }
                 active = self._sim_state in {"paused", "replay_paused"}
-            elif button.key == f"type_{self.challenge_type}":
-                active = True
             elif button.key == f"cam_{self.camera_mode}":
                 active = True
             self._draw_button(button, active=active, enabled=enabled)

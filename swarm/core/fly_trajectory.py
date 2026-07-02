@@ -414,7 +414,7 @@ def _saved_run_from_path(path: Path) -> SavedRunInfo:
 def list_saved_runs(
     repo_root: Path | None = None,
     *,
-    limit: int = 50,
+    limit: int | None = None,
 ) -> list[SavedRunInfo]:
     root = fly_runs_dir(repo_root)
     if not root.is_dir():
@@ -424,8 +424,10 @@ def list_saved_runs(
         key=lambda item: item.stat().st_mtime,
         reverse=True,
     )
+    if limit is not None:
+        candidates = candidates[: max(0, int(limit))]
     runs: list[SavedRunInfo] = []
-    for path in candidates[:limit]:
+    for path in candidates:
         try:
             run = _saved_run_from_path(path)
             result = _peek_trajectory_result(path)
@@ -469,7 +471,7 @@ def load_trajectory(path: Path) -> FlyTrajectory:
 
 
 def load_latest_trajectory(repo_root: Path | None = None) -> FlyTrajectory | None:
-    for run in list_saved_runs(repo_root, limit=50):
+    for run in list_saved_runs(repo_root):
         try:
             return load_trajectory(run.path)
         except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
@@ -490,7 +492,7 @@ def browse_run_file(
 
     start_dir = fly_runs_dir(repo_root)
     start_dir.mkdir(parents=True, exist_ok=True)
-    runs = list_saved_runs(repo_root, limit=40)
+    runs = list_saved_runs(repo_root)
 
     if on_before_dialog is not None:
         on_before_dialog()

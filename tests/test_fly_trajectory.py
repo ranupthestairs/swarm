@@ -7,6 +7,7 @@ import numpy as np
 from swarm.core.fly_trajectory import (
     FlyTrajectory,
     FlyTrajectoryFrame,
+    RUN_FILE_SUFFIX,
     agent_name_from_path,
     fly_runs_dir,
     format_score_summary,
@@ -136,6 +137,42 @@ def test_format_score_summary() -> None:
         {"score": 0.89, "success_term": 1.0, "time_term": 0.82, "safety_term": 0.55}
     )
     assert summary == "0.89  S:1.00  T:0.82  Saf:0.55"
+
+
+def test_list_saved_runs_lists_all_runs_by_default(tmp_path: Path) -> None:
+    import os
+
+    from swarm.core.fly_trajectory import fly_runs_dir
+
+    frame = FlyTrajectoryFrame(
+        t_sim=0.02,
+        frame=1,
+        position=np.array([1.0, 2.0, 3.0]),
+        quaternion=np.array([0.0, 0.0, 0.0, 1.0]),
+        velocity=np.array([0.1, 0.2, 0.0]),
+        action=np.array([0.0, 0.0, 1.0, 0.5, 0.0]),
+    )
+    for idx in range(55):
+        trajectory = FlyTrajectory(
+            meta={
+                "agent_name": "agent",
+                "seed": idx,
+                "challenge_type": 1,
+                "type_label": "city",
+                "agent_path": "/tmp/agent",
+                "agent_kind": "source",
+                "result": {"success": True, "score": 0.5},
+            },
+            frames=[frame],
+        )
+        path = fly_runs_dir(tmp_path) / (
+            f"agent_seed{idx}_city_20260701_{idx:06d}{RUN_FILE_SUFFIX}"
+        )
+        save_trajectory(trajectory, path)
+        os.utime(path, (idx, idx))
+
+    runs = list_saved_runs(tmp_path)
+    assert len(runs) == 55
 
 
 def test_list_saved_runs_skips_corrupt_trajectory(tmp_path: Path) -> None:

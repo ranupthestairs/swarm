@@ -3,7 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from scripts.fly_model import _handle_start_pause
+from scripts.fly_model import _handle_start_pause, _replay_step_interval_and_stride
 
 
 def _window() -> MagicMock:
@@ -91,3 +91,27 @@ def test_start_aborts_active_replay() -> None:
     assert state == "running"
     assert reset_episode is True
     window.set_replay_ui_active.assert_called_once_with(False)
+
+
+def test_replay_step_interval_and_stride() -> None:
+    from swarm.constants import SIM_DT
+
+    interval, stride = _replay_step_interval_and_stride(0.5)
+    assert stride == 1
+    assert interval == SIM_DT / 0.5
+
+    interval, stride = _replay_step_interval_and_stride(1.0)
+    assert stride == 1
+    assert interval == SIM_DT
+
+    interval, stride = _replay_step_interval_and_stride(2.0)
+    assert stride == 2
+    assert interval == SIM_DT
+
+    interval, stride = _replay_step_interval_and_stride(4.0)
+    assert stride == 4
+    assert interval == SIM_DT
+
+    interval, stride = _replay_step_interval_and_stride(8.0)
+    assert stride == 8
+    assert interval == SIM_DT
