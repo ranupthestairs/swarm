@@ -167,6 +167,35 @@ def test_camera_mode_switch_resets_smoothing() -> None:
     assert camera._smoothing_mode == "fpv"
 
 
+def test_filter_saved_runs_matches_agent_seed_and_map() -> None:
+    from pathlib import Path
+
+    from swarm.core.fly_trajectory import SavedRunInfo
+    from swarm.core.fly_viewer import filter_saved_runs
+
+    runs = [
+        SavedRunInfo(
+            path=Path("/tmp/champion_UID_191_seed1001_city.flytraj.json.gz"),
+            display_name="champion_UID_191 seed1001 city",
+            agent_name="champion_UID_191",
+            seed=1001,
+            type_label="city",
+            score_summary="0.89  S:1.00  T:0.82  Saf:0.55",
+        ),
+        SavedRunInfo(
+            path=Path("/tmp/249_seed177550_warehouse.flytraj.json.gz"),
+            display_name="249 seed177550 warehouse",
+            agent_name="249",
+            seed=177550,
+            type_label="warehouse",
+        ),
+    ]
+    assert len(filter_saved_runs(runs, "")) == 2
+    assert len(filter_saved_runs(runs, "warehouse")) == 1
+    assert filter_saved_runs(runs, "177550")[0].seed == 177550
+    assert len(filter_saved_runs(runs, "champion")) == 1
+
+
 def test_saved_runs_scrollbar_helpers() -> None:
     from pathlib import Path
 
@@ -183,6 +212,7 @@ def test_saved_runs_scrollbar_helpers() -> None:
                 for idx in range(10)
             ]
             self.run_scroll = 0
+            self.run_search_text = ""
 
     window = _FakeWindow()
     assert window._saved_runs_max_scroll() == 10 - SAVED_RUN_VISIBLE_ROWS

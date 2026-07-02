@@ -1439,11 +1439,13 @@ class DroneFlightController:
     def _can_enter_landing_mode(self, distance_to_goal: float) -> bool:
         if float(distance_to_goal) >= 4.0:
             return False
-        prob = float(getattr(self, "_last_goal_visibility_prob", 0.0) or 0.0)
-        return bool(
-            self._goal_is_tracked
-            and prob > VILLAGE_LANDING_MIN_PROBABILITY
-        )
+        if self._xgb_map_is({"village"}):
+            prob = float(getattr(self, "_last_goal_visibility_prob", 0.0) or 0.0)
+            return bool(
+                self._goal_is_tracked
+                and prob > VILLAGE_LANDING_MIN_PROBABILITY
+            )
+        return bool(self.is_find_P)
 
     def _can_enter_goal_return_mode(self):
         if self._xgb_map_is({"village"}):
@@ -1720,8 +1722,8 @@ class DroneFlightController:
         dist_to_go = np.linalg.norm(goal_pos - self.landing_platform)
         if self.move_in_auto_mode:
             dist_to_go = np.linalg.norm(goal_pos - self.reverse_d - self.landing_platform)
-        self.p_buffer = 0.7 * self.p_buffer + 0.3 * dist_to_go
-        if dist_to_go < 0.1 and  self.p_buffer < 0.1 and is_visible:
+        self.p_buffer = 0.5 * self.p_buffer + 0.5 * dist_to_go
+        if dist_to_go < 0.2 and  self.p_buffer < 0.2 and is_visible:
             self.is_find_P = True
         else:
             self.is_find_P = False

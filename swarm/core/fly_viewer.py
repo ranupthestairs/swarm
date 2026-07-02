@@ -51,20 +51,22 @@ OVERVIEW_ORBIT_DEG_SEC = 5.0
 SAVED_RUN_ROW_HEIGHT = 30
 SAVED_RUN_VISIBLE_ROWS = 6
 SAVED_RUN_SCROLLBAR_WIDTH = 10
+SAVED_RUN_SEARCH_HEIGHT = 24
 MAP_TYPE_BOX_HEIGHT = 26
 MAP_TYPE_OPTION_HEIGHT = 24
 
 Y_MAP_LABEL = 202
 Y_MAP_BOX = 222
 Y_RUNS_LABEL = 258
-Y_RUNS_TOP = 276
-Y_SIMULATION_LABEL = 464
-Y_BUILD = 474
-Y_CTRL = 504
-Y_REPLAY_ROW = 534
-Y_EXPORT = 564
-Y_CAMERA_LABEL = 590
-Y_CAMERA = 614
+Y_RUNS_SEARCH = 276
+Y_RUNS_TOP = Y_RUNS_SEARCH + SAVED_RUN_SEARCH_HEIGHT + 4
+Y_SIMULATION_LABEL = 492
+Y_BUILD = 502
+Y_CTRL = 532
+Y_REPLAY_ROW = 562
+Y_EXPORT = 592
+Y_CAMERA_LABEL = 618
+Y_CAMERA = 642
 
 
 def compute_left_panel_min_height() -> int:
@@ -76,6 +78,26 @@ def compute_left_panel_min_height() -> int:
 
 
 LEFT_PANEL_MIN_HEIGHT = compute_left_panel_min_height()
+
+
+def _saved_run_search_blob(run: SavedRunInfo) -> str:
+    parts = [
+        run.display_name,
+        run.path.name,
+        str(run.agent_name or ""),
+        str(run.seed or ""),
+        str(run.type_label or ""),
+        str(run.score_summary or ""),
+        str(run.score or ""),
+    ]
+    return " ".join(parts).lower()
+
+
+def filter_saved_runs(runs: Sequence[SavedRunInfo], query: str) -> list[SavedRunInfo]:
+    needle = str(query).strip().lower()
+    if not needle:
+        return list(runs)
+    return [run for run in runs if needle in _saved_run_search_blob(run)]
 
 
 def _fmt_vec(values: Any, precision: int = 2) -> str:
@@ -600,6 +622,8 @@ class FlySimulatorWindow:
         self.repo_root = repo_root
         self.saved_runs: list[SavedRunInfo] = []
         self.run_scroll = 0
+        self.run_search_text = ""
+        self.run_search_active = False
         self.selected_run_path: str | None = None
         self.replay_speed = 1.0
         self._replay_ui_active = False
@@ -646,10 +670,21 @@ class FlySimulatorWindow:
 
     def refresh_saved_runs(self) -> None:
         self.saved_runs = list_saved_runs(self.repo_root)
+        self._clamp_run_scroll()
+
+    def _filtered_saved_runs(self) -> list[SavedRunInfo]:
+        return filter_saved_runs(self.saved_runs, self.run_search_text)
+
+    def _clamp_run_scroll(self) -> None:
         self.run_scroll = max(
             0,
             min(self.run_scroll, self._saved_runs_max_scroll()),
         )
+
+    def _set_run_search_text(self, text: str) -> None:
+        self.run_search_text = text
+        self.run_scroll = 0
+        self._clamp_run_scroll()
 
     def apply_loaded_trajectory(self, trajectory: Any) -> None:
         """Sync launch controls from a loaded trajectory and close dropdowns."""
@@ -662,9 +697,13 @@ class FlySimulatorWindow:
         self._map_type_open = False
         self.seed_active = False
         self.custom_active = False
+        self.run_search_active = False
 
     def _saved_runs_max_scroll(self) -> int:
-        return max(0, len(self.saved_runs) - SAVED_RUN_VISIBLE_ROWS)
+        return max(0, len(self._filtered_saved_runs()) - SAVED_RUN_VISIBLE_ROWS)
+
+    def _runs_search_field_rect(self) -> tuple[int, int, int, int]:
+        return (10, Y_RUNS_SEARCH, PANEL_WIDTH - 20, SAVED_RUN_SEARCH_HEIGHT)
 
     def _map_type_label(self, challenge_type: int) -> str:
         for value, label in MAP_TYPE_CHOICES:
@@ -700,7 +739,7 @@ class FlySimulatorWindow:
 
     def _saved_runs_scrollbar_thumb_rect(self) -> tuple[int, int, int, int]:
         track = self._saved_runs_scrollbar_track_rect()
-        total = len(self.saved_runs)
+        total = len(self._filtered_saved_runs())
         if total <= SAVED_RUN_VISIBLE_ROWS:
             return track
         max_scroll = self._saved_runs_max_scroll()
@@ -949,6 +988,7 @@ class FlySimulatorWindow:
         self.seed_active = False
         self.custom_active = False
         self._map_type_open = False
+        self.run_search_active = False
 
     def _resolve_agent_path(self) -> tuple[Path, str] | None:
         active = self._active_agent_display_path()
@@ -1000,15 +1040,23 @@ class FlySimulatorWindow:
             bx, by, bw, bh = seed_field
             if bx <= x <= bx + bw and by <= y <= by + bh:
                 return "seed_field"
+            search_field = self._runs_search_field_rect()
+            bx, by, bw, bh = search_field
+            if bx <= x <= bx + bw and by <= y <= by + bh:
+                return "runs_search_field"
+            visible_runs = self._filtered_saved_runs()
             track = self._saved_runs_scrollbar_track_rect()
             bx, by, bw, bh = track
             if (
                 bx <= x <= bx + bw
                 and by <= y <= by + bh
-                and len(self.saved_runs) > SAVED_RUN_VISIBLE_ROWS
+                and len(visible_runs) > SAVED_RUN_VISIBLE_ROWS
             ):
                 return "run_scrollbar"
             for row in range(SAVED_RUN_VISIBLE_ROWS):
+                index = self.run_scroll + row
+                if index >= len(visible_runs):
+                    break
                 rect = self._run_row_rect(row)
                 bx, by, bw, bh = rect
                 if bx <= x <= bx + bw and by <= y <= by + bh:
@@ -1027,7 +1075,7 @@ class FlySimulatorWindow:
                 event.quit = True
             elif pg_event.type == pygame.KEYDOWN:
                 if pg_event.key == pygame.K_ESCAPE:
-                    if self.seed_active or self.custom_active:
+                    if self.seed_active or self.custom_active or self.run_search_active:
                         self._deactivate_inputs()
                     else:
                         self.quit_requested = True
@@ -1049,6 +1097,14 @@ class FlySimulatorWindow:
                         event.build_map = True
                     elif pg_event.unicode and pg_event.unicode.isprintable():
                         self.custom_path += pg_event.unicode
+                elif self.run_search_active:
+                    if pg_event.key == pygame.K_BACKSPACE:
+                        self._set_run_search_text(self.run_search_text[:-1])
+                    elif pg_event.key == pygame.K_RETURN:
+                        self.run_search_active = False
+                    elif pg_event.unicode and pg_event.unicode.isprintable():
+                        if len(self.run_search_text) < 48:
+                            self._set_run_search_text(self.run_search_text + pg_event.unicode)
             elif pg_event.type == pygame.MOUSEBUTTONDOWN:
                 if pg_event.button == 1:
                     key = self._hit_test(pg_event.pos)
@@ -1057,13 +1113,22 @@ class FlySimulatorWindow:
                             self._commit_seed_text()
                         self.seed_active = False
                         self._map_type_open = False
+                        self.run_search_active = False
                         self.custom_active = True
                         self.use_last_agent = False
                     elif key == "seed_field":
                         if self.custom_active:
                             self.custom_active = False
                         self._map_type_open = False
+                        self.run_search_active = False
                         self.seed_active = True
+                    elif key == "runs_search_field":
+                        if self.seed_active:
+                            self._commit_seed_text()
+                        self.seed_active = False
+                        self.custom_active = False
+                        self._map_type_open = False
+                        self.run_search_active = True
                     elif key == "map_type_box":
                         if self.seed_active:
                             self._commit_seed_text()
@@ -1118,12 +1183,13 @@ class FlySimulatorWindow:
                         suffix = key.split("_", 1)[1]
                         if suffix.isdigit():
                             run_index = int(suffix)
-                            if 0 <= run_index < len(self.saved_runs):
-                                picked = str(self.saved_runs[run_index].path)
+                            visible_runs = self._filtered_saved_runs()
+                            if 0 <= run_index < len(visible_runs):
+                                picked = str(visible_runs[run_index].path)
                                 event.load_run_path = picked
                                 self.selected_run_path = picked
                                 self.set_status(
-                                    f"Loaded run: {self.saved_runs[run_index].display_name}"
+                                    f"Loaded run: {visible_runs[run_index].display_name}"
                                 )
                     elif key == "replay_timeline":
                         self._timeline_dragging = True
@@ -1280,6 +1346,29 @@ class FlySimulatorWindow:
         self.screen.blit(arrow, (map_box[0] + map_box[2] - 16, map_box[1] + 6))
 
         self.screen.blit(self._font.render("Saved runs", True, (210, 210, 210)), (12, self._runs_label_y))
+        visible_runs = self._filtered_saved_runs()
+        if self.run_search_text.strip():
+            count_label = f"({len(visible_runs)}/{len(self.saved_runs)})"
+            self.screen.blit(
+                self._font_small.render(count_label, True, (150, 170, 200)),
+                (108, self._runs_label_y + 2),
+            )
+        search_field = self._runs_search_field_rect()
+        pygame.draw.rect(
+            self.screen,
+            (48, 48, 58) if self.run_search_active else (34, 34, 38),
+            search_field,
+            border_radius=4,
+        )
+        pygame.draw.rect(self.screen, (90, 90, 95), search_field, width=1, border_radius=4)
+        search_display = self.run_search_text
+        if not search_display and not self.run_search_active:
+            search_display = "search agent, seed, map..."
+        search_display += "|" if self.run_search_active else ""
+        self.screen.blit(
+            self._font_small.render(search_display, True, (200, 200, 205)),
+            (search_field[0] + 6, search_field[1] + 5),
+        )
         list_rect = self._saved_runs_list_rect()
         pygame.draw.rect(
             self.screen,
@@ -1290,9 +1379,9 @@ class FlySimulatorWindow:
         pygame.draw.rect(self.screen, (55, 55, 60), list_rect, width=1, border_radius=4)
         for row in range(SAVED_RUN_VISIBLE_ROWS):
             index = self.run_scroll + row
-            if index >= len(self.saved_runs):
+            if index >= len(visible_runs):
                 break
-            run = self.saved_runs[index]
+            run = visible_runs[index]
             rect = self._run_row_rect(row)
             selected = self.selected_run_path == str(run.path)
             pygame.draw.rect(
@@ -1320,7 +1409,7 @@ class FlySimulatorWindow:
                     (rect[0] + 6, rect[1] + 15),
                 )
 
-        if len(self.saved_runs) > SAVED_RUN_VISIBLE_ROWS:
+        if len(visible_runs) > SAVED_RUN_VISIBLE_ROWS:
             track = self._saved_runs_scrollbar_track_rect()
             thumb = self._saved_runs_scrollbar_thumb_rect()
             pygame.draw.rect(self.screen, (40, 40, 48), track, border_radius=4)

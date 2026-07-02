@@ -359,7 +359,7 @@ Distributed under the MIT License. See [LICENSE](LICENSE) for details.
   <sub>Subnet 124 on <a href="https://bittensor.com">Bittensor</a></sub>
 </p>
 
-swarm fly --source miners/champion_UID_191/ --batch seeds.json
+swarm fly --source miners/191_safety/ --batch seeds.json
 
 [1/7] type4 village seed3775295852 ...
     failed  0.01  S:0.00  T:0.00  Saf:0.00  -> champion_UID_191_seed3775295852_village_20260701_074143.flytraj.json.gz
