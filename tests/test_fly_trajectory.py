@@ -255,3 +255,41 @@ def test_video_path_matches_trajectory_basename(tmp_path: Path) -> None:
     assert video_name.endswith(".mp4")
     assert video_name.startswith("champion_UID_191_seed1001_city_")
     assert video_path_for_trajectory(traj_path) == traj_path.with_name(video_name)
+
+
+def test_format_saved_run_timestamp_parses_iso_and_filename_stamp() -> None:
+    from swarm.core.fly_trajectory import format_saved_run_timestamp
+
+    assert format_saved_run_timestamp("2026-07-01T15:30:00+00:00") == "2026-07-01 08:30"
+    assert format_saved_run_timestamp("20260701 153045") == "2026-07-01 08:30"
+
+
+def test_list_saved_runs_includes_created_at_from_meta(tmp_path: Path) -> None:
+    from swarm.core.fly_trajectory import format_saved_run_timestamp
+
+    frame = FlyTrajectoryFrame(
+        t_sim=0.02,
+        frame=1,
+        position=np.array([1.0, 2.0, 3.0]),
+        quaternion=np.array([0.0, 0.0, 0.0, 1.0]),
+        velocity=np.array([0.1, 0.2, 0.0]),
+        action=np.array([0.0, 0.0, 1.0, 0.5, 0.0]),
+    )
+    trajectory = FlyTrajectory(
+        meta={
+            "created_at": "2026-06-30T14:51:00+00:00",
+            "agent_name": "grit14",
+            "seed": 42,
+            "challenge_type": 1,
+            "type_label": "city",
+            "agent_path": "/tmp/grit14",
+            "agent_kind": "source",
+            "result": {"success": True, "score": 0.5},
+        },
+        frames=[frame],
+    )
+    save_trajectory(trajectory, repo_root=tmp_path)
+    runs = list_saved_runs(tmp_path)
+    assert len(runs) == 1
+    assert runs[0].created_at == "2026-06-30T14:51:00+00:00"
+    assert format_saved_run_timestamp(runs[0].created_at) == "2026-06-30 07:51"

@@ -1722,8 +1722,11 @@ class DroneFlightController:
         dist_to_go = np.linalg.norm(goal_pos - self.landing_platform)
         if self.move_in_auto_mode:
             dist_to_go = np.linalg.norm(goal_pos - self.reverse_d - self.landing_platform)
-        self.p_buffer = 0.5 * self.p_buffer + 0.5 * dist_to_go
-        if dist_to_go < 0.2 and  self.p_buffer < 0.2 and is_visible:
+        self._last_goal_pos = goal_pos.copy()
+        self._last_dist_to_go = float(dist_to_go)
+        self._last_pad_lock_is_visible = bool(is_visible)
+        self.p_buffer = 0.7 * self.p_buffer + 0.3 * dist_to_go
+        if dist_to_go < 0.1 and  self.p_buffer < 0.1 and is_visible:
             self.is_find_P = True
         else:
             self.is_find_P = False

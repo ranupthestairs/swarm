@@ -1789,7 +1789,7 @@ class DroneFlightController:
 
     def _village_yolo26n_enabled(self) -> bool:
         
-        return self._yolo26n_inferencer is not None and self._xgb_map_is({"village"}) and self._mode in ("search", "navigation") and self._is_goal_visible == False and self._distance_to_search_area <= MAX_REAR_DIST
+        return self._yolo26n_inferencer is not None and (self._xgb_map_is({"village"}) or self._xgb_map_is({"mountain"})) and self._mode in ("search", "navigation") and self._is_goal_visible == False and self._distance_to_search_area <= MAX_REAR_DIST
 
     def _load_yolo26n_model(self, yolo26n_model_path: Path) -> None:
         yolo26n_model_path = Path(yolo26n_model_path)
@@ -1983,6 +1983,7 @@ class DroneFlightController:
         self.reverse_landing_platform = 0.7 * (self.landing_platform + self.reverse_d) + 0.3 * goal_pos
         self.landing_platform = 0.7 * self.landing_platform + 0.3 * goal_pos
         self.detect_reverse_direction(goal_pos, self.reverse_landing_platform)
+        self._refresh_pad_lock(detector_visible=True)
 
     def _confirmed_map_label(
         self,
@@ -2320,6 +2321,28 @@ class DroneFlightController:
         )
         self._static_landing_ready = window_ready
 
+    def _refresh_pad_lock(self, *, detector_visible: bool) -> None:
+        """Update is_find_P from current platform/landing estimates and detector visibility."""
+        if self.platform_position is None or self.landing_platform is None:
+            self._last_pad_lock_is_visible = bool(detector_visible)
+            self.is_find_P = False
+            return
+
+        goal_pos = np.asarray(self.platform_position, dtype=np.float64).reshape(3)
+        dist_to_go = float(np.linalg.norm(goal_pos - self.landing_platform))
+        if self.move_in_auto_mode:
+            dist_to_go = float(
+                np.linalg.norm(goal_pos - self.reverse_d - self.landing_platform)
+            )
+        self._last_goal_pos = goal_pos.copy()
+        self._last_dist_to_go = dist_to_go
+        self._last_pad_lock_is_visible = bool(detector_visible)
+        self.p_buffer = 0.7 * self.p_buffer + 0.3 * dist_to_go
+        if dist_to_go < 0.1 and self.p_buffer < 0.1 and detector_visible:
+            self.is_find_P = True
+        else:
+            self.is_find_P = False
+
     def _update_static_landing_lock(self, detection_probability, predicted_goal_position, drone_position=None):
         if self._landing_committed:
             return
@@ -2414,11 +2437,7 @@ class DroneFlightController:
         dist_to_go = np.linalg.norm(goal_pos - self.landing_platform)
         if self.move_in_auto_mode:
             dist_to_go = np.linalg.norm(goal_pos - self.reverse_d - self.landing_platform)
-        self.p_buffer = 0.7 * self.p_buffer + 0.3 * dist_to_go
-        if dist_to_go < 0.1 and  self.p_buffer < 0.1 and is_visible:
-            self.is_find_P = True
-        else:
-            self.is_find_P = False
+        self._refresh_pad_lock(detector_visible=bool(is_visible))
         return pr, tr, pv, pq[:3]
     
     def detect_reverse_direction(self, a, b):

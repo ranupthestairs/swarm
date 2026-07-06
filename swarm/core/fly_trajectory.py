@@ -310,6 +310,82 @@ def format_score_detail_lines(result: dict[str, Any] | None) -> list[str]:
     return lines
 
 
+def _parse_saved_run_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if "T" in text:
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+    for fmt in ("%Y%m%d %H%M%S", "%Y%m%d_%H%M%S"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def format_saved_run_timestamp(
+    created_at: str | None,
+    *,
+    path: Path | None = None,
+) -> str | None:
+    """Compact local timestamp for saved-run list rows."""
+    dt = _parse_saved_run_timestamp(created_at)
+    if dt is None and path is not None:
+        try:
+            dt = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        except OSError:
+            return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def _peek_trajectory_created_at(path: Path, *, head_bytes: int = 16384) -> str | None:
+    """Read created_at from trajectory meta without loading frame data."""
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            chunk = handle.read(head_bytes)
+    except (OSError, UnicodeDecodeError):
+        return None
+    match = re.search(r'"created_at"\s*:\s*"([^"]+)"', chunk)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _saved_run_with_created_at(path: Path, run: SavedRunInfo) -> SavedRunInfo:
+    created = _peek_trajectory_created_at(path) or run.created_at
+    if created is None:
+        try:
+            created = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
+        except OSError:
+            return run
+    if created == run.created_at:
+        return run
+    return SavedRunInfo(
+        path=run.path,
+        display_name=run.display_name,
+        agent_name=run.agent_name,
+        seed=run.seed,
+        type_label=run.type_label,
+        score=run.score,
+        success=run.success,
+        time_sec=run.time_sec,
+        success_term=run.success_term,
+        time_term=run.time_term,
+        safety_term=run.safety_term,
+        collision=run.collision,
+        score_summary=run.score_summary,
+        created_at=created,
+    )
+
+
 def _peek_trajectory_result(path: Path, *, head_bytes: int = 65536) -> dict[str, Any] | None:
     """Read score fields from trajectory meta without loading frame data."""
     try:
@@ -429,7 +505,7 @@ def list_saved_runs(
     runs: list[SavedRunInfo] = []
     for path in candidates:
         try:
-            run = _saved_run_from_path(path)
+            run = _saved_run_with_created_at(path, _saved_run_from_path(path))
             result = _peek_trajectory_result(path)
             runs.append(_saved_run_with_result(path, run, result))
         except OSError:

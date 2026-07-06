@@ -49,9 +49,14 @@ from swarm.core.fly_viewer import (
     DEFAULT_VIEW_WIDTH,
     FlyRenderCamera,
     FlySimulatorWindow,
+    ReplayGoalMarkers,
     ReplayUiState,
+    _pad_lock_dist_to_go,
     build_bottom_telemetry_lines,
     export_video,
+    extract_flight_vector,
+    replay_estimated_goal_from_agent_info,
+    replay_mission_goal,
 )
 from swarm.utils.env_factory import make_env
 from swarm.validator.reward import flight_score_details
@@ -246,64 +251,135 @@ def _parse_observation(obs: dict[str, Any]) -> dict[str, Any]:
 
 def _capture_drone_camera_frames(
     env,
-) -> tuple[np.ndarray | None, np.ndarray | None]:
+) -> tuple[np.ndarray | None, np.ndarray | None, Any | None]:
     """Live onboard RGB + colourised depth for the fly UI preview."""
-    from swarm.core.fly_viewer import colourise_depth_normalized
+    from swarm.core.fly_viewer import DroneCameraPose, colourise_depth_normalized
 
     capture = getattr(env, "capture_drone_camera_preview", None)
     if not callable(capture):
-        return None, None
+        return None, None, None
     try:
         rgb, depth = capture(0)
+        camera_pose = None
+        pose_fn = getattr(env, "_drone_onboard_camera_pose", None)
+        if callable(pose_fn):
+            camera_pos, camera_target, camera_up = pose_fn(0)
+            fov_deg = float(getattr(env, "_fov", 90.0))
+            aspect = 1.0
+            img_res = getattr(env, "IMG_RES", None)
+            if img_res is not None:
+                aspect = float(img_res[0]) / max(float(img_res[1]), 1.0)
+            camera_pose = DroneCameraPose(
+                camera_pos=np.asarray(camera_pos, dtype=float),
+                camera_target=np.asarray(camera_target, dtype=float),
+                camera_up=np.asarray(camera_up, dtype=float),
+                fov_deg=fov_deg,
+                aspect=aspect,
+            )
         return (
             np.asarray(rgb, dtype=np.uint8).copy(),
             colourise_depth_normalized(depth),
+            camera_pose,
         )
     except Exception:
-        return None, None
+        return None, None, None
 
 
 def _snapshot_agent_debug(agent: Any) -> dict[str, Any]:
+    info: dict[str, Any] = {}
     if hasattr(agent, "get_debug_info") and callable(agent.get_debug_info):
         try:
-            info = agent.get_debug_info()
-            if isinstance(info, dict):
-                return info
+            debug_info = agent.get_debug_info()
+            if isinstance(debug_info, dict):
+                info.update(debug_info)
         except Exception:
             pass
 
-    landing_platform = getattr(agent, "landing_platform", None)
+    landing_platform = info.get("landing_platform_position")
+    if landing_platform is None:
+        landing_platform = info.get("predicted_goal_position")
+    if landing_platform is None:
+        landing_platform = getattr(agent, "landing_platform", None)
     if landing_platform is None:
         landing_platform = getattr(agent, "platform_position", None)
 
-    goal_visibility_prob = getattr(agent, "_last_goal_visibility_prob", None)
+    raw_goal_position = info.get("raw_goal_position")
+    if raw_goal_position is None:
+        raw_goal_position = getattr(agent, "_last_goal_pos", None)
+    if raw_goal_position is None:
+        raw_goal_position = getattr(agent, "platform_position", None)
+
+    move_in_auto_mode = info.get("move_in_auto_mode")
+    if move_in_auto_mode is None:
+        move_in_auto_mode = bool(getattr(agent, "move_in_auto_mode", False))
+
+    pad_lock_dist_to_go = info.get("pad_lock_dist_to_go")
+    if pad_lock_dist_to_go is None:
+        pad_lock_dist_to_go = getattr(agent, "_last_dist_to_go", None)
+    if (
+        pad_lock_dist_to_go is None
+        and raw_goal_position is not None
+        and landing_platform is not None
+    ):
+        pad_lock_dist_to_go = _pad_lock_dist_to_go(
+            raw_goal_position,
+            landing_platform,
+            move_in_auto_mode=move_in_auto_mode,
+            reverse_d=getattr(agent, "reverse_d", None),
+        )
+
+    goal_visibility_prob = info.get("goal_visibility_prob")
+    if goal_visibility_prob is None:
+        goal_visibility_prob = getattr(agent, "_last_goal_visibility_prob", None)
     if goal_visibility_prob is None:
         goal_visibility_prob = getattr(agent, "goal_visibility_prob", None)
 
-    map_label = getattr(agent, "_map_prediction_label", None)
-    map_prob = getattr(agent, "_map_prediction_probability", None)
-    if map_label is not None and map_prob is not None:
-        map_prediction = f"{map_label}:{float(map_prob):.3f}"
-    else:
-        map_prediction = None
+    map_prediction = info.get("map_prediction")
+    if map_prediction is None:
+        map_label = getattr(agent, "_map_prediction_label", None)
+        map_prob = getattr(agent, "_map_prediction_probability", None)
+        if map_label is not None and map_prob is not None:
+            map_prediction = f"{map_label}:{float(map_prob):.3f}"
 
-    last_action = getattr(agent, "_last_action", None)
-    if last_action is None:
-        last_action = getattr(agent, "last_action", None)
+    command_action = info.get("command_action")
+    if command_action is None:
+        last_action = getattr(agent, "_last_action", None)
+        if last_action is None:
+            last_action = getattr(agent, "last_action", None)
+        command_action = None if last_action is None else np.asarray(last_action, dtype=float)
 
-    return {
-        "mode": getattr(agent, "_mode", getattr(agent, "mode", None)),
-        "goal_detected": getattr(agent, "is_find_P", getattr(agent, "goal_detected", None)),
-        "goal_visible": getattr(agent, "see_P", getattr(agent, "goal_visible", None)),
-        "goal_tracked": getattr(agent, "_goal_is_tracked", getattr(agent, "goal_tracked", None)),
-        "goal_visibility_prob": goal_visibility_prob,
-        "predicted_goal_position": landing_platform,
-        "platform_lost_steps": getattr(agent, "platform_lost_step", None),
-        "goal_distance_buffer": getattr(agent, "p_buffer", None),
-        "map_prediction": map_prediction,
-        "command_action": None if last_action is None else np.asarray(last_action, dtype=float),
-        "tracking": getattr(agent, "tracking", None),
-    }
+    info.setdefault("mode", getattr(agent, "_mode", getattr(agent, "mode", None)))
+    info.setdefault(
+        "goal_detected",
+        getattr(agent, "is_find_P", getattr(agent, "goal_detected", None)),
+    )
+    info.setdefault(
+        "goal_visible",
+        getattr(agent, "see_P", getattr(agent, "goal_visible", None)),
+    )
+    info.setdefault(
+        "goal_tracked",
+        getattr(agent, "_goal_is_tracked", getattr(agent, "goal_tracked", None)),
+    )
+    info.setdefault("goal_visibility_prob", goal_visibility_prob)
+    info.setdefault("predicted_goal_position", landing_platform)
+    info.setdefault(
+        "raw_goal_position",
+        None if raw_goal_position is None else np.asarray(raw_goal_position, dtype=float),
+    )
+    info.setdefault(
+        "landing_platform_position",
+        None if landing_platform is None else np.asarray(landing_platform, dtype=float),
+    )
+    info.setdefault("pad_lock_dist_to_go", pad_lock_dist_to_go)
+    info.setdefault("pad_lock_detector_visible", getattr(agent, "_last_pad_lock_is_visible", None))
+    info.setdefault("move_in_auto_mode", move_in_auto_mode)
+    info.setdefault("platform_lost_steps", getattr(agent, "platform_lost_step", None))
+    info.setdefault("goal_distance_buffer", getattr(agent, "p_buffer", None))
+    info.setdefault("map_prediction", map_prediction)
+    info.setdefault("command_action", command_action)
+    info.setdefault("tracking", getattr(agent, "tracking", None))
+    return info
 
 
 def _fmt_vec3(values: Any, precision: int = 2) -> str:
@@ -321,9 +397,13 @@ def _print_debug_frame(
     action: np.ndarray,
 ) -> None:
     act = np.asarray(action, dtype=float).reshape(-1)
+    yaw_err = agent_info.get("yaw_error_deg")
+    yaw_txt = "-" if yaw_err is None else f"{float(yaw_err):.0f}°"
     print(
         f"{frame:5d} {t_sim:5.2f} pos={_fmt_vec3(obs_info['position'])} "
         f"spd={obs_info['speed_mps']:.2f} mode={agent_info.get('mode')} "
+        f"ctrl={agent_info.get('active_controller', '-')} "
+        f"yaw_err={yaw_txt} fwd={agent_info.get('forward')} "
         f"goal={agent_info.get('goal_detected')} act={act.round(2).tolist()}"
     )
 
@@ -687,6 +767,10 @@ def fly_episode(
     obs = None
     drone_cam_rgb: np.ndarray | None = None
     depth_rgb: np.ndarray | None = None
+    camera_pose = None
+    direction_world = None
+    speed_mps = 0.0
+    direction_source = "none"
 
     sim_state = "config"
     t_sim = 0.0
@@ -699,6 +783,7 @@ def fly_episode(
     trajectory_frames: list[FlyTrajectoryFrame] = []
     replay_index = 0
     replay_speed = 1.0
+    goal_markers = ReplayGoalMarkers()
     current_launch_cfg: FlyLaunchConfig | None = None
     video_path: Path | None = None
     score = 0.0
@@ -954,6 +1039,10 @@ def fly_episode(
             frame_rgb = None
             drone_cam_rgb = None
             depth_rgb = None
+            camera_pose = None
+            direction_world = None
+            speed_mps = 0.0
+            direction_source = "none"
             if env is not None and task is not None:
                 if sim_state == "running" and lo is not None and hi is not None:
                     if now - last_step_at >= SIM_DT:
@@ -1073,6 +1162,17 @@ def fly_episode(
                     p.stepSimulation(physicsClientId=cli)
                     last_preview_step_at = now
 
+                if sim_state in {"replay", "replay_paused", "replay_finished"} and last_trajectory is not None:
+                    cli = getattr(env, "CLIENT", getattr(env, "_cli", 0))
+                    goal_markers.update(
+                        cli,
+                        mission_goal=replay_mission_goal(last_trajectory, task),
+                        estimated_goal=replay_estimated_goal_from_agent_info(agent_info),
+                    )
+                else:
+                    cli = getattr(env, "CLIENT", getattr(env, "_cli", 0))
+                    goal_markers.hide(cli)
+
                 frame_rgb = _render_scene(
                     env,
                     camera,
@@ -1080,7 +1180,11 @@ def fly_episode(
                     height=view_height,
                     dt=SIM_DT,
                 )
-                drone_cam_rgb, depth_rgb = _capture_drone_camera_frames(env)
+                drone_cam_rgb, depth_rgb, camera_pose = _capture_drone_camera_frames(env)
+                direction_world, speed_mps, direction_source = extract_flight_vector(
+                    last_action,
+                    obs_info,
+                )
                 if sim_state == "running":
                     recorded_frames.append(frame_rgb.copy())
 
@@ -1123,6 +1227,10 @@ def fly_episode(
                 replay_ui=replay_ui,
                 drone_cam_rgb=drone_cam_rgb,
                 depth_rgb=depth_rgb,
+                direction_world=direction_world,
+                speed_mps=speed_mps,
+                direction_source=direction_source,
+                camera_pose=camera_pose,
             )
 
             if realtime and sim_state in {"running", "replay"}:

@@ -15,15 +15,18 @@ from swarm.core.fly_setup import (
     resolve_agent_path,
     save_last_agent_path,
 )
+from swarm.constants import SPEED_LIMIT
 from swarm.core.fly_trajectory import (
     SavedRunInfo,
     browse_run_file,
+    format_saved_run_timestamp,
     list_saved_runs,
 )
 
 CAMERA_MODES: tuple[str, ...] = ("chase", "fpv", "top", "overview")
 PANEL_WIDTH = 320
-BOTTOM_PANEL_HEIGHT = 228
+BOTTOM_PANEL_HEIGHT = 280
+TELEMETRY_MAX_LINES = 14
 REPLAY_BAR_HEIGHT = 58
 REPLAY_BAR_MARGIN = 12
 LEFT_PANEL_BOTTOM_PADDING = 24
@@ -36,6 +39,7 @@ DEPTH_PREVIEW_SIZE = 140
 DEPTH_PREVIEW_INSET = 10
 DEPTH_PREVIEW_GAP = 6
 DEPTH_COLORMAP_NAME = "inferno"
+DIRECTION_STRIP_HEIGHT = 14
 # Validator seeds are drawn from [0, 2**32 - 1] (up to 12 digits).
 SEED_TEXT_MAX_LEN = 12
 
@@ -89,8 +93,21 @@ def _saved_run_search_blob(run: SavedRunInfo) -> str:
         str(run.type_label or ""),
         str(run.score_summary or ""),
         str(run.score or ""),
+        str(run.created_at or ""),
+        str(format_saved_run_timestamp(run.created_at, path=run.path) or ""),
     ]
     return " ".join(parts).lower()
+
+
+def _saved_run_detail_line(run: SavedRunInfo) -> str | None:
+    timestamp = format_saved_run_timestamp(run.created_at, path=run.path)
+    score_line = run.score_summary
+    if score_line is None and "  |  " in run.display_name:
+        score_line = run.display_name.split("  |  ", 1)[1]
+    parts = [part for part in (timestamp, score_line) if part]
+    if not parts:
+        return None
+    return "  ·  ".join(parts)
 
 
 def filter_saved_runs(runs: Sequence[SavedRunInfo], query: str) -> list[SavedRunInfo]:
@@ -113,6 +130,25 @@ def _fmt_bool(value: Any) -> str:
     if value is None:
         return "?"
     return "yes" if bool(value) else "no"
+
+
+def _pad_lock_dist_to_go(
+    goal_pos: Any,
+    landing_platform: Any,
+    *,
+    move_in_auto_mode: bool = False,
+    reverse_d: Any = None,
+) -> float:
+    goal = np.asarray(goal_pos, dtype=float).reshape(3)
+    landing = np.asarray(landing_platform, dtype=float).reshape(3)
+    if move_in_auto_mode:
+        reverse = (
+            np.zeros(3, dtype=float)
+            if reverse_d is None
+            else np.asarray(reverse_d, dtype=float).reshape(3)
+        )
+        return float(np.linalg.norm(goal - reverse - landing))
+    return float(np.linalg.norm(goal - landing))
 
 
 def _goal_detection_lines(
@@ -138,7 +174,28 @@ def _goal_detection_lines(
     dist_buf = agent_info.get("goal_distance_buffer")
     if dist_buf is not None:
         status_parts.append(f"dist_buf={float(dist_buf):.2f}")
+    det_frame = agent_info.get("pad_lock_detector_visible")
+    if det_frame is not None:
+        status_parts.append(f"det_frame={_fmt_bool(det_frame)}")
     lines.append("Goal detect  " + "  ".join(status_parts))
+
+    raw_goal = agent_info.get("raw_goal_position")
+    landing_plat = agent_info.get("landing_platform_position")
+    if landing_plat is None:
+        landing_plat = agent_info.get("predicted_goal_position")
+    dist_to_go = agent_info.get("pad_lock_dist_to_go")
+    if raw_goal is not None or landing_plat is not None or dist_to_go is not None:
+        pad_parts: list[str] = []
+        if raw_goal is not None:
+            pad_parts.append(f"goal_pos {_fmt_vec(raw_goal)}")
+        if landing_plat is not None:
+            pad_parts.append(f"landing_plat {_fmt_vec(landing_plat)}")
+        if dist_to_go is not None:
+            pad_parts.append(f"dist_to_go={float(dist_to_go):.3f}")
+        move_auto = agent_info.get("move_in_auto_mode")
+        if move_auto is not None:
+            pad_parts.append(f"auto={_fmt_bool(move_auto)}")
+        lines.append("Pad lock   " + "  ".join(pad_parts))
 
     predicted = agent_info.get("predicted_goal_position")
     if predicted is None:
@@ -160,6 +217,149 @@ def _goal_detection_lines(
         true_goal = np.asarray(task.goal, dtype=float).reshape(3)
         detail_parts.append(f"err_true_pad={float(np.linalg.norm(pred - true_goal)):.1f}m")
     lines.append("  ".join(detail_parts))
+    return lines
+
+
+def _controller_state_lines(agent_info: dict[str, Any]) -> list[str]:
+    """Build controller-internal rows for the bottom telemetry panel."""
+    lines: list[str] = []
+
+    control_parts: list[str] = []
+    active = agent_info.get("active_controller")
+    if active is not None:
+        control_parts.append(f"ctrl={active}")
+    for key, label in (
+        ("forward", "fwd"),
+        ("first_order", "1st"),
+        ("goal_return", "ret"),
+        ("landing_committed", "commit"),
+        ("static_landing_ready", "static"),
+        ("committed_descent", "desc"),
+        ("tracking", "track"),
+        ("mountain_flight", "mtn"),
+        ("high_takeoff", "hi_to"),
+        ("is_hatt", "hatt"),
+    ):
+        value = agent_info.get(key)
+        if value is not None:
+            control_parts.append(f"{label}={_fmt_bool(value)}")
+
+    search_pattern = agent_info.get("search_pattern")
+    search_stage = agent_info.get("search_stage")
+    if search_pattern is not None or search_stage is not None:
+        control_parts.append(
+            f"search={search_pattern or '-'}:st{search_stage if search_stage is not None else '-'}"
+        )
+
+    first_order_cnt = agent_info.get("first_order_cnt")
+    if first_order_cnt is not None:
+        control_parts.append(f"1st_cnt={int(first_order_cnt)}")
+
+    goal_return_steps = agent_info.get("goal_return_steps")
+    if goal_return_steps is not None and bool(agent_info.get("goal_return")):
+        control_parts.append(f"ret_steps={int(goal_return_steps)}")
+
+    search_progress_m = agent_info.get("search_progress_m")
+    altitude_m = agent_info.get("altitude_m")
+    if search_progress_m is not None:
+        control_parts.append(f"search_d={float(search_progress_m):.1f}m")
+    if altitude_m is not None:
+        control_parts.append(f"alt={float(altitude_m):.1f}m")
+
+    landing_hdist = agent_info.get("landing_hdist")
+    if landing_hdist is not None:
+        control_parts.append(f"land_h={float(landing_hdist):.2f}m")
+
+    map_prob_count = agent_info.get("map_prob_count")
+    map_tick = agent_info.get("map_tick")
+    if map_prob_count is not None:
+        control_parts.append(f"map_n={int(map_prob_count)}")
+    if map_tick is not None:
+        control_parts.append(f"map_t={int(map_tick)}")
+
+    if control_parts:
+        lines.append("Control  " + "  ".join(control_parts))
+
+    yaw_parts: list[str] = []
+    for key, label, precision in (
+        ("yaw_deg", "yaw", 0),
+        ("yaw_target_deg", "tgt", 0),
+        ("yaw_error_deg", "err", 0),
+    ):
+        value = agent_info.get(key)
+        if value is not None:
+            yaw_parts.append(f"{label}={float(value):.{precision}f}°")
+    if yaw_parts:
+        lines.append("Yaw      " + "  ".join(yaw_parts))
+
+    obstacle_clearance_m = agent_info.get("obstacle_clearance_m")
+    if obstacle_clearance_m is not None:
+        obstacle_parts = [f"clr={float(obstacle_clearance_m):.2f}m"]
+        lateral_clearance_m = agent_info.get("lateral_clearance_m")
+        if lateral_clearance_m is not None:
+            obstacle_parts.append(f"lat={float(lateral_clearance_m):.2f}m")
+        side_hull_clearance_m = agent_info.get("side_hull_clearance_m")
+        if side_hull_clearance_m is not None:
+            obstacle_parts.append(f"hull={float(side_hull_clearance_m):.2f}m")
+        forward_clearance_m = agent_info.get("forward_clearance_m")
+        if forward_clearance_m is not None:
+            obstacle_parts.append(f"fwd={float(forward_clearance_m):.2f}m")
+        obstacle_speed_scale = agent_info.get("obstacle_speed_scale")
+        if obstacle_speed_scale is not None and float(obstacle_speed_scale) < 0.999:
+            obstacle_parts.append(f"spd={float(obstacle_speed_scale):.2f}")
+        max_world_speed_mps = agent_info.get("obstacle_max_world_speed_mps")
+        if max_world_speed_mps is not None:
+            obstacle_parts.append(f"vmax={float(max_world_speed_mps):.1f}")
+        obstacle_speed_cap_applied = agent_info.get("obstacle_speed_cap_applied")
+        if obstacle_speed_cap_applied is not None:
+            obstacle_parts.append(f"cap_on={_fmt_bool(obstacle_speed_cap_applied)}")
+        lines.append("Obstacle " + "  ".join(obstacle_parts))
+
+    throttle_parts: list[str] = []
+    command_action = agent_info.get("command_action")
+    final_action = agent_info.get("final_action")
+    prev_action = agent_info.get("prev_action")
+    if command_action is not None:
+        cmd = np.asarray(command_action, dtype=float).reshape(-1)
+        if cmd.size >= 5:
+            throttle_parts.append(f"cmd_spd={cmd[3]:.2f}")
+            throttle_parts.append(f"cmd_yaw={cmd[4]:+.2f}")
+    if final_action is not None:
+        out = np.asarray(final_action, dtype=float).reshape(-1)
+        if out.size >= 5:
+            throttle_parts.append(f"out_spd={out[3]:.2f}")
+            throttle_parts.append(f"out_yaw={out[4]:+.2f}")
+    if prev_action is not None:
+        prev = np.asarray(prev_action, dtype=float).reshape(-1)
+        if prev.size >= 5:
+            throttle_parts.append(f"prev_spd={prev[3]:.2f}")
+    gov_max_v_err = agent_info.get("gov_max_v_err")
+    if gov_max_v_err is not None:
+        throttle_parts.append(f"gov={float(gov_max_v_err):.2f}")
+    tilt_deg = agent_info.get("tilt_deg")
+    if tilt_deg is not None:
+        throttle_parts.append(f"tilt={float(tilt_deg):.0f}°")
+    if throttle_parts:
+        lines.append("Throttle " + "  ".join(throttle_parts))
+
+    eye_parts: list[str] = []
+    eye_prob = agent_info.get("eye_prob")
+    if eye_prob is None:
+        eye_prob = agent_info.get("goal_visibility_prob")
+    if eye_prob is not None:
+        eye_parts.append(f"prob={float(eye_prob):.2f}")
+    eye_lost_steps = agent_info.get("eye_lost_steps")
+    if eye_lost_steps is not None:
+        eye_parts.append(f"lost={int(eye_lost_steps)}")
+    eye_filter_initialized = agent_info.get("eye_filter_initialized")
+    if eye_filter_initialized is not None:
+        eye_parts.append(f"filt={_fmt_bool(eye_filter_initialized)}")
+    detector_mode = agent_info.get("detector_mode")
+    if detector_mode is not None:
+        eye_parts.append(f"det={detector_mode}")
+    if eye_parts:
+        lines.append("Eye      " + "  ".join(eye_parts))
+
     return lines
 
 
@@ -199,6 +399,7 @@ def build_bottom_telemetry_lines(
             f"Mode {agent_info.get('mode') or '-':12s}   "
             f"map={map_pred if map_pred is not None else '-'}"
         )
+        lines.extend(_controller_state_lines(agent_info))
         lines.extend(
             _goal_detection_lines(agent_info, obs_info=obs_info, task=task)
         )
@@ -391,6 +592,195 @@ def colourise_depth_normalized(depth: np.ndarray) -> np.ndarray:
         return np.stack([grey, grey, grey], axis=-1)
 
 
+@dataclass(frozen=True)
+class DroneCameraPose:
+    """Onboard depth-camera pose used for direction projection."""
+
+    camera_pos: np.ndarray
+    camera_target: np.ndarray
+    camera_up: np.ndarray
+    fov_deg: float
+    aspect: float = 1.0
+
+
+def extract_flight_vector(
+    action: np.ndarray | None,
+    obs_info: dict[str, Any] | None,
+) -> tuple[np.ndarray | None, float, str]:
+    """Return world-frame direction, speed (m/s), and source label for HUD."""
+    if action is not None:
+        act = np.asarray(action, dtype=float).reshape(-1)
+        if act.size >= 4:
+            direction = act[:3]
+            speed = float(act[3])
+            if float(np.linalg.norm(direction)) > 1e-9:
+                return direction, speed, "command"
+            if speed > 1e-9:
+                return np.array([1.0, 0.0, 0.0], dtype=float), speed, "command"
+    if obs_info is not None:
+        velocity = np.asarray(obs_info.get("velocity"), dtype=float).reshape(3)
+        speed = float(obs_info.get("speed_mps", np.linalg.norm(velocity)))
+        if speed > 1e-9 or float(np.linalg.norm(velocity)) > 1e-9:
+            return velocity, speed, "velocity"
+    return None, 0.0, "none"
+
+
+def _camera_view_basis(
+    camera_pos: np.ndarray,
+    camera_target: np.ndarray,
+    camera_up: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    forward = np.asarray(camera_target, dtype=float) - np.asarray(camera_pos, dtype=float)
+    forward /= max(float(np.linalg.norm(forward)), 1e-9)
+    right = np.cross(forward, np.asarray(camera_up, dtype=float))
+    right /= max(float(np.linalg.norm(right)), 1e-9)
+    up = np.cross(right, forward)
+    up /= max(float(np.linalg.norm(up)), 1e-9)
+    return forward, right, up
+
+
+def project_world_direction_to_uv(
+    direction_world: np.ndarray,
+    *,
+    camera_pos: np.ndarray,
+    camera_target: np.ndarray,
+    camera_up: np.ndarray,
+    fov_deg: float,
+    aspect: float = 1.0,
+) -> tuple[float, float, bool]:
+    """Map a world-space direction to normalized depth-camera coords (u, v)."""
+    direction = np.asarray(direction_world, dtype=float).reshape(3)
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-9:
+        return 0.5, 0.5, False
+    direction = direction / norm
+
+    forward, right, up = _camera_view_basis(camera_pos, camera_target, camera_up)
+    x = float(np.dot(direction, right))
+    y = float(np.dot(direction, up))
+    z = float(np.dot(direction, forward))
+    if z <= 1e-3:
+        return 0.5, 0.5, False
+
+    v_fov_rad = math.radians(float(fov_deg))
+    h_fov_rad = 2.0 * math.atan(math.tan(v_fov_rad * 0.5) * max(float(aspect), 1e-9))
+    u = 0.5 + (math.atan2(x, z) / h_fov_rad)
+    v = 0.5 - (math.atan2(y, z) / v_fov_rad)
+    visible = -0.05 <= u <= 1.05 and -0.05 <= v <= 1.05
+    return u, v, visible
+
+
+def _clip_uv_to_unit_square(u: float, v: float) -> tuple[float, float]:
+    du = u - 0.5
+    dv = v - 0.5
+    max_abs = max(abs(du), abs(dv), 1e-9)
+    if max_abs <= 0.48:
+        return u, v
+    scale = 0.48 / max_abs
+    return 0.5 + du * scale, 0.5 + dv * scale
+
+
+def _set_pixel_rgb(
+    img: np.ndarray,
+    x: int,
+    y: int,
+    color: tuple[int, int, int],
+    *,
+    radius: int = 0,
+) -> None:
+    h, w = img.shape[:2]
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            px, py = x + dx, y + dy
+            if 0 <= px < w and 0 <= py < h:
+                img[py, px] = color
+
+
+def _draw_line_rgb(
+    img: np.ndarray,
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    color: tuple[int, int, int],
+    *,
+    thickness: int = 1,
+) -> None:
+    dx = abs(x1 - x0)
+    dy = -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx + dy
+    x, y = x0, y0
+    half = max(0, thickness // 2)
+    while True:
+        for oy in range(-half, half + 1):
+            for ox in range(-half, half + 1):
+                _set_pixel_rgb(img, x + ox, y + oy, color)
+        if x == x1 and y == y1:
+            break
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x += sx
+        if e2 <= dx:
+            err += dx
+            y += sy
+
+
+def _draw_speed_strip_rgb(
+    img: np.ndarray,
+    speed_mps: float,
+    *,
+    max_speed: float = SPEED_LIMIT,
+) -> None:
+    h, w = img.shape[:2]
+    strip_h = min(DIRECTION_STRIP_HEIGHT, max(6, h // 10))
+    y0 = h - strip_h
+    img[y0:h, :, :3] = (18, 18, 24)
+    fill_w = int(round(min(max(speed_mps / max(max_speed, 1e-9), 0.0), 1.0) * max(w - 4, 1)))
+    if fill_w > 0:
+        img[y0 + 2 : h - 2, 2 : 2 + fill_w, :3] = (48, 210, 120)
+
+
+def annotate_depth_direction_overlay(
+    depth_rgb: np.ndarray,
+    *,
+    direction_world: np.ndarray | None,
+    speed_mps: float,
+    camera_pose: DroneCameraPose | None,
+) -> np.ndarray:
+    """Draw command/velocity direction projected into the depth camera view."""
+    out = np.asarray(depth_rgb, dtype=np.uint8).copy()
+    if out.ndim != 3 or out.shape[2] < 3:
+        return out
+    h, w = out.shape[:2]
+    cx, cy = w // 2, h // 2
+    cross = (170, 170, 175)
+    _draw_line_rgb(out, cx - 7, cy, cx + 7, cy, cross, thickness=1)
+    _draw_line_rgb(out, cx, cy - 7, cx, cy + 7, cross, thickness=1)
+
+    if camera_pose is not None and direction_world is not None:
+        u, v, visible = project_world_direction_to_uv(
+            direction_world,
+            camera_pos=camera_pose.camera_pos,
+            camera_target=camera_pose.camera_target,
+            camera_up=camera_pose.camera_up,
+            fov_deg=camera_pose.fov_deg,
+            aspect=camera_pose.aspect,
+        )
+        draw_u, draw_v = _clip_uv_to_unit_square(u, v)
+        ex = int(round(draw_u * (w - 1)))
+        ey = int(round(draw_v * (h - 1)))
+        arrow = (70, 255, 150) if visible else (255, 180, 70)
+        _draw_line_rgb(out, cx, cy, ex, ey, arrow, thickness=2)
+        tip = (255, 80, 80) if visible else (255, 140, 60)
+        _set_pixel_rgb(out, ex, ey, tip, radius=2)
+
+    _draw_speed_strip_rgb(out, speed_mps)
+    return out
+
+
 def _drone_basis(quat: Sequence[float]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     import pybullet as p
 
@@ -489,6 +879,112 @@ class FlyRenderCamera:
             )
             target = midpoint
         return eye.astype(float), target.astype(float)
+
+
+_HIDDEN_MARKER_POS = (-1000.0, -1000.0, -1000.0)
+
+
+def replay_estimated_goal_from_agent_info(
+    agent_info: dict[str, Any] | None,
+) -> np.ndarray | None:
+    if not agent_info:
+        return None
+    for key in (
+        "landing_platform_position",
+        "predicted_goal_position",
+        "raw_goal_position",
+    ):
+        value = agent_info.get(key)
+        if value is not None:
+            return np.asarray(value, dtype=float).reshape(3)
+    return None
+
+
+def replay_mission_goal(
+    trajectory: Any | None,
+    task: Any | None,
+) -> np.ndarray | None:
+    if trajectory is not None:
+        goal = getattr(trajectory, "meta", {}).get("goal")
+        if goal is not None:
+            return np.asarray(goal, dtype=float).reshape(3)
+    if task is not None:
+        goal = getattr(task, "goal", None)
+        if goal is not None:
+            return np.asarray(goal, dtype=float).reshape(3)
+    return None
+
+
+class ReplayGoalMarkers:
+    """Visual-only PyBullet markers for mission goal and pad estimate during replay."""
+
+    def __init__(self) -> None:
+        self._mission_uid: int | None = None
+        self._estimate_uid: int | None = None
+        self._cli: int | None = None
+
+    def _sphere(self, cli: int, rgba: Sequence[float], radius: float) -> int:
+        import pybullet as p
+
+        visual = p.createVisualShape(
+            shapeType=p.GEOM_SPHERE,
+            radius=float(radius),
+            rgbaColor=[float(c) for c in rgba],
+            physicsClientId=cli,
+        )
+        return int(
+            p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=-1,
+                baseVisualShapeIndex=visual,
+                basePosition=list(_HIDDEN_MARKER_POS),
+                physicsClientId=cli,
+            )
+        )
+
+    def ensure(self, cli: int) -> None:
+        if self._cli == cli and self._mission_uid is not None:
+            return
+        self._cli = cli
+        self._mission_uid = self._sphere(cli, [0.15, 0.95, 0.25, 0.9], 0.45)
+        self._estimate_uid = self._sphere(cli, [1.0, 0.55, 0.1, 0.85], 0.35)
+
+    def _place(self, uid: int | None, pos: Sequence[float] | None) -> None:
+        import pybullet as p
+
+        if uid is None or self._cli is None:
+            return
+        if pos is None:
+            p.resetBasePositionAndOrientation(
+                uid,
+                list(_HIDDEN_MARKER_POS),
+                [0.0, 0.0, 0.0, 1.0],
+                physicsClientId=self._cli,
+            )
+            return
+        p.resetBasePositionAndOrientation(
+            uid,
+            [float(pos[0]), float(pos[1]), float(pos[2])],
+            [0.0, 0.0, 0.0, 1.0],
+            physicsClientId=self._cli,
+        )
+
+    def update(
+        self,
+        cli: int,
+        *,
+        mission_goal: Sequence[float] | None = None,
+        estimated_goal: Sequence[float] | None = None,
+    ) -> None:
+        self.ensure(cli)
+        self._place(self._mission_uid, mission_goal)
+        self._place(self._estimate_uid, estimated_goal)
+
+    def hide(self, cli: int | None = None) -> None:
+        target = cli if cli is not None else self._cli
+        if target is None:
+            return
+        self.update(target, mission_goal=None, estimated_goal=None)
 
 
 def render_rgb_frame(
@@ -932,6 +1428,26 @@ class FlySimulatorWindow:
                 label,
                 label.get_rect(center=(rect[0] + rect[2] // 2, rect[1] + rect[3] // 2)),
             )
+
+    def _draw_goal_marker_legend(self) -> None:
+        pygame = self._pygame
+        x0 = PANEL_WIDTH + self.view_width - 168
+        y0 = 10
+        if self._replay_ui_active:
+            y0 = max(10, self._replay_bar_top() - 58)
+        legend = pygame.Surface((158, 46), pygame.SRCALPHA)
+        legend.fill((12, 12, 16, 185))
+        pygame.draw.rect(legend, (90, 90, 95), (0, 0, 158, 46), width=1, border_radius=4)
+        for row, (color, text) in enumerate(
+            (
+                ((38, 242, 64), "Mission goal"),
+                ((255, 140, 26), "Pad estimate"),
+            )
+        ):
+            y = 8 + row * 18
+            pygame.draw.circle(legend, color, (12, y + 6), 5)
+            legend.blit(self._font_small.render(text, True, (220, 220, 225)), (24, y))
+        self.screen.blit(legend, (x0, y0))
 
     def remember_agent(self, path: Path) -> None:
         resolved = save_last_agent_path(path)
@@ -1397,15 +1913,13 @@ class FlySimulatorWindow:
                 self._font_small.render(title, True, (230, 230, 230)),
                 (rect[0] + 6, rect[1] + 3),
             )
-            score_line = run.score_summary
-            if score_line is None and "  |  " in run.display_name:
-                score_line = run.display_name.split("  |  ", 1)[1]
-            if score_line:
-                score_text = score_line
-                if len(score_text) > 40:
-                    score_text = score_text[:37] + "..."
+            detail_line = _saved_run_detail_line(run)
+            if detail_line:
+                detail_text = detail_line
+                if len(detail_text) > 40:
+                    detail_text = detail_text[:37] + "..."
                 self.screen.blit(
-                    self._font_small.render(score_text, True, (170, 210, 170)),
+                    self._font_small.render(detail_text, True, (155, 175, 195)),
                     (rect[0] + 6, rect[1] + 15),
                 )
 
@@ -1509,6 +2023,10 @@ class FlySimulatorWindow:
         *,
         drone_cam_rgb: np.ndarray | None,
         depth_rgb: np.ndarray | None,
+        direction_world: np.ndarray | None = None,
+        speed_mps: float = 0.0,
+        direction_source: str = "none",
+        camera_pose: DroneCameraPose | None = None,
     ) -> None:
         size = DEPTH_PREVIEW_SIZE
         inset = DEPTH_PREVIEW_INSET
@@ -1524,13 +2042,108 @@ class FlySimulatorWindow:
             )
             y += size + DEPTH_PREVIEW_GAP
         if depth_rgb is not None:
-            self._blit_camera_panel(
+            annotated_depth = annotate_depth_direction_overlay(
                 depth_rgb,
+                direction_world=direction_world,
+                speed_mps=speed_mps,
+                camera_pose=camera_pose,
+            )
+            source_label = {
+                "command": "cmd",
+                "velocity": "vel",
+            }.get(direction_source, "")
+            speed_suffix = f"  {speed_mps:.2f} m/s"
+            if source_label:
+                depth_label = f"Depth ({source_label}){speed_suffix}"
+            else:
+                depth_label = f"Depth{speed_suffix}"
+            self._blit_camera_panel(
+                annotated_depth,
                 x=x,
                 y=y,
                 size=size,
-                label="Depth",
+                label=depth_label,
             )
+            y += size + DEPTH_PREVIEW_GAP
+            self._draw_direction_projection_strip(
+                x=x,
+                y=y,
+                width=size,
+                direction_world=direction_world,
+                speed_mps=speed_mps,
+                direction_source=direction_source,
+                camera_pose=camera_pose,
+            )
+
+    def _draw_direction_projection_strip(
+        self,
+        *,
+        x: int,
+        y: int,
+        width: int,
+        direction_world: np.ndarray | None,
+        speed_mps: float,
+        direction_source: str,
+        camera_pose: DroneCameraPose | None,
+    ) -> None:
+        """Mini strip below depth preview showing camera-plane projection."""
+        pygame = self._pygame
+        height = DIRECTION_STRIP_HEIGHT + 18
+        backing = pygame.Surface((width + 8, height), pygame.SRCALPHA)
+        backing.fill((12, 12, 16, 210))
+        self.screen.blit(backing, (x - 4, y - 2))
+
+        label = "Direction"
+        if direction_source == "command":
+            label = "Direction (command)"
+        elif direction_source == "velocity":
+            label = "Direction (velocity)"
+        self.screen.blit(
+            self._font_small.render(label, True, (210, 210, 215)),
+            (x, y),
+        )
+
+        strip_y = y + 16
+        strip_h = DIRECTION_STRIP_HEIGHT
+        rect = pygame.Rect(x, strip_y, width, strip_h)
+        pygame.draw.rect(self.screen, (24, 24, 30), rect, border_radius=3)
+        pygame.draw.rect(self.screen, (70, 70, 78), rect, width=1, border_radius=3)
+
+        center_x = x + width // 2
+        center_y = strip_y + strip_h // 2
+        pygame.draw.line(
+            self.screen,
+            (110, 110, 118),
+            (center_x - 5, center_y),
+            (center_x + 5, center_y),
+            1,
+        )
+        pygame.draw.line(
+            self.screen,
+            (110, 110, 118),
+            (center_x, center_y - 5),
+            (center_x, center_y + 5),
+            1,
+        )
+
+        if camera_pose is not None and direction_world is not None:
+            u, v, visible = project_world_direction_to_uv(
+                direction_world,
+                camera_pos=camera_pose.camera_pos,
+                camera_target=camera_pose.camera_target,
+                camera_up=camera_pose.camera_up,
+                fov_deg=camera_pose.fov_deg,
+                aspect=camera_pose.aspect,
+            )
+            draw_u, draw_v = _clip_uv_to_unit_square(u, v)
+            end_x = x + int(round(draw_u * (width - 1)))
+            end_y = strip_y + int(round(draw_v * (strip_h - 1)))
+            color = (70, 230, 140) if visible else (255, 180, 70)
+            pygame.draw.line(self.screen, color, (center_x, center_y), (end_x, end_y), 2)
+            pygame.draw.circle(self.screen, (255, 80, 80), (end_x, end_y), 3)
+
+        speed_text = self._font_small.render(f"{speed_mps:.2f} m/s", True, (180, 240, 190))
+        self.screen.blit(speed_text, (x + width - speed_text.get_width(), y))
 
     def draw(
         self,
@@ -1541,6 +2154,10 @@ class FlySimulatorWindow:
         replay_ui: ReplayUiState | None = None,
         drone_cam_rgb: np.ndarray | None = None,
         depth_rgb: np.ndarray | None = None,
+        direction_world: np.ndarray | None = None,
+        speed_mps: float = 0.0,
+        direction_source: str = "none",
+        camera_pose: DroneCameraPose | None = None,
     ) -> None:
         pygame = self._pygame
         self.screen.fill((24, 24, 28))
@@ -1572,12 +2189,19 @@ class FlySimulatorWindow:
             self._replay_ui_active = False
             self._replay_total_frames = 1
 
+        if replay_ui is not None and frame_rgb is not None:
+            self._draw_goal_marker_legend()
+
         if frame_rgb is not None and (
             drone_cam_rgb is not None or depth_rgb is not None
         ):
             self._draw_drone_camera_panels(
                 drone_cam_rgb=drone_cam_rgb,
                 depth_rgb=depth_rgb,
+                direction_world=direction_world,
+                speed_mps=speed_mps,
+                direction_source=direction_source,
+                camera_pose=camera_pose,
             )
 
         pygame.draw.line(
@@ -1606,7 +2230,7 @@ class FlySimulatorWindow:
             (12, bottom_y + 8),
         )
         line_y = bottom_y + 32
-        for line in bottom_lines[:11]:
+        for line in bottom_lines[:TELEMETRY_MAX_LINES]:
             self.screen.blit(self._font_small.render(line, True, (205, 205, 205)), (12, line_y))
             line_y += 18
 
