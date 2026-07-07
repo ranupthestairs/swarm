@@ -1162,7 +1162,7 @@ class DroneFlightController:
         
         if self._xgb_map_is({"forest"}) and self._mode in ("search", "navigation"):
             action = np.asarray(action, dtype=np.float32).copy()
-            action[3] = np.float32(min(float(action[3]), 0.65))
+            action[3] = np.float32(min(float(action[3]), 0.68))
         final_action = self._getSecondOrderAction(action, state, is_smooth=is_first_order)
         _tilt = max(abs(float(drone_rpy[0])), abs(float(drone_rpy[1])))
         _max_v_err = max(0.2, 2.2 - (2.0 / 0.7) * max(0.0, _tilt - 0.3))

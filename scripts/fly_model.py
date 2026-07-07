@@ -285,6 +285,24 @@ def _capture_drone_camera_frames(
         return None, None, None
 
 
+def _resolve_debug_controller(agent: Any) -> Any:
+    """Return the object that holds live debug state (handles wrapper agents)."""
+    if agent is None:
+        return agent
+
+    active = getattr(agent, "_active", None)
+    if active == "forest" and hasattr(agent, "_forest"):
+        return getattr(agent, "_forest")
+    if hasattr(agent, "_main"):
+        return getattr(agent, "_main")
+    if hasattr(agent, "_engine"):
+        return getattr(agent, "_engine")
+    inner = getattr(agent, "_controller", None)
+    if inner is not None:
+        return inner
+    return agent
+
+
 def _snapshot_agent_debug(agent: Any) -> dict[str, Any]:
     info: dict[str, Any] = {}
     if hasattr(agent, "get_debug_info") and callable(agent.get_debug_info):
@@ -295,27 +313,43 @@ def _snapshot_agent_debug(agent: Any) -> dict[str, Any]:
         except Exception:
             pass
 
+    target = _resolve_debug_controller(agent)
+    if (
+        target is not agent
+        and hasattr(target, "get_debug_info")
+        and callable(target.get_debug_info)
+    ):
+        try:
+            debug_info = target.get_debug_info()
+            if isinstance(debug_info, dict):
+                for key, value in debug_info.items():
+                    info.setdefault(key, value)
+        except Exception:
+            pass
+
     landing_platform = info.get("landing_platform_position")
     if landing_platform is None:
         landing_platform = info.get("predicted_goal_position")
     if landing_platform is None:
-        landing_platform = getattr(agent, "landing_platform", None)
+        landing_platform = getattr(target, "landing_platform", None)
     if landing_platform is None:
-        landing_platform = getattr(agent, "platform_position", None)
+        landing_platform = getattr(target, "platform_position", None)
+    if landing_platform is None:
+        landing_platform = getattr(target, "_landing_platform_position", None)
 
     raw_goal_position = info.get("raw_goal_position")
     if raw_goal_position is None:
-        raw_goal_position = getattr(agent, "_last_goal_pos", None)
+        raw_goal_position = getattr(target, "_last_goal_pos", None)
     if raw_goal_position is None:
-        raw_goal_position = getattr(agent, "platform_position", None)
+        raw_goal_position = getattr(target, "platform_position", None)
 
     move_in_auto_mode = info.get("move_in_auto_mode")
     if move_in_auto_mode is None:
-        move_in_auto_mode = bool(getattr(agent, "move_in_auto_mode", False))
+        move_in_auto_mode = bool(getattr(target, "move_in_auto_mode", False))
 
     pad_lock_dist_to_go = info.get("pad_lock_dist_to_go")
     if pad_lock_dist_to_go is None:
-        pad_lock_dist_to_go = getattr(agent, "_last_dist_to_go", None)
+        pad_lock_dist_to_go = getattr(target, "_last_dist_to_go", None)
     if (
         pad_lock_dist_to_go is None
         and raw_goal_position is not None
@@ -325,41 +359,43 @@ def _snapshot_agent_debug(agent: Any) -> dict[str, Any]:
             raw_goal_position,
             landing_platform,
             move_in_auto_mode=move_in_auto_mode,
-            reverse_d=getattr(agent, "reverse_d", None),
+            reverse_d=getattr(target, "reverse_d", None),
         )
 
     goal_visibility_prob = info.get("goal_visibility_prob")
     if goal_visibility_prob is None:
-        goal_visibility_prob = getattr(agent, "_last_goal_visibility_prob", None)
+        goal_visibility_prob = getattr(target, "_last_goal_visibility_prob", None)
     if goal_visibility_prob is None:
-        goal_visibility_prob = getattr(agent, "goal_visibility_prob", None)
+        goal_visibility_prob = getattr(target, "goal_visibility_prob", None)
+    if goal_visibility_prob is None:
+        goal_visibility_prob = getattr(target, "_swarm_debug_eye_probability", None)
 
     map_prediction = info.get("map_prediction")
     if map_prediction is None:
-        map_label = getattr(agent, "_map_prediction_label", None)
-        map_prob = getattr(agent, "_map_prediction_probability", None)
+        map_label = getattr(target, "_map_prediction_label", None)
+        map_prob = getattr(target, "_map_prediction_probability", None)
         if map_label is not None and map_prob is not None:
             map_prediction = f"{map_label}:{float(map_prob):.3f}"
 
     command_action = info.get("command_action")
     if command_action is None:
-        last_action = getattr(agent, "_last_action", None)
+        last_action = getattr(target, "_last_action", None)
         if last_action is None:
-            last_action = getattr(agent, "last_action", None)
+            last_action = getattr(target, "last_action", None)
         command_action = None if last_action is None else np.asarray(last_action, dtype=float)
 
-    info.setdefault("mode", getattr(agent, "_mode", getattr(agent, "mode", None)))
+    info.setdefault("mode", getattr(target, "_mode", getattr(target, "mode", None)))
     info.setdefault(
         "goal_detected",
-        getattr(agent, "is_find_P", getattr(agent, "goal_detected", None)),
+        getattr(target, "is_find_P", getattr(target, "goal_detected", None)),
     )
     info.setdefault(
         "goal_visible",
-        getattr(agent, "see_P", getattr(agent, "goal_visible", None)),
+        getattr(target, "see_P", getattr(target, "goal_visible", None)),
     )
     info.setdefault(
         "goal_tracked",
-        getattr(agent, "_goal_is_tracked", getattr(agent, "goal_tracked", None)),
+        getattr(target, "_goal_is_tracked", getattr(target, "goal_tracked", None)),
     )
     info.setdefault("goal_visibility_prob", goal_visibility_prob)
     info.setdefault("predicted_goal_position", landing_platform)
@@ -372,13 +408,17 @@ def _snapshot_agent_debug(agent: Any) -> dict[str, Any]:
         None if landing_platform is None else np.asarray(landing_platform, dtype=float),
     )
     info.setdefault("pad_lock_dist_to_go", pad_lock_dist_to_go)
-    info.setdefault("pad_lock_detector_visible", getattr(agent, "_last_pad_lock_is_visible", None))
+    info.setdefault("pad_lock_detector_visible", getattr(target, "_last_pad_lock_is_visible", None))
     info.setdefault("move_in_auto_mode", move_in_auto_mode)
-    info.setdefault("platform_lost_steps", getattr(agent, "platform_lost_step", None))
-    info.setdefault("goal_distance_buffer", getattr(agent, "p_buffer", None))
+    info.setdefault("platform_lost_steps", getattr(target, "platform_lost_step", None))
+    info.setdefault("goal_distance_buffer", getattr(target, "p_buffer", None))
     info.setdefault("map_prediction", map_prediction)
     info.setdefault("command_action", command_action)
-    info.setdefault("tracking", getattr(agent, "tracking", None))
+    info.setdefault("tracking", getattr(target, "tracking", None))
+    if hasattr(agent, "_active"):
+        info.setdefault("active_controller", getattr(agent, "_active", None) or "selecting")
+    if hasattr(agent, "_tick"):
+        info.setdefault("controller_tick", int(getattr(agent, "_tick", 0)))
     return info
 
 

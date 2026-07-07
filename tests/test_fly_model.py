@@ -66,6 +66,37 @@ def test_snapshot_agent_debug_includes_pad_lock_fields() -> None:
     assert info["move_in_auto_mode"] is False
 
 
+def test_snapshot_agent_debug_unwraps_wrapper_controller() -> None:
+    class _Inner:
+        _mode = "navigation"
+        is_find_P = True
+        see_P = True
+        _goal_is_tracked = True
+        _map_prediction_label = "mountain"
+        _map_prediction_probability = 0.88
+        _swarm_debug_eye_probability = 0.73
+        landing_platform = np.array([10.0, 5.0, 2.0], dtype=float)
+        tracking = False
+
+    class _Wrapper:
+        def __init__(self) -> None:
+            self._main = _Inner()
+            self._forest = _Inner()
+            self._active = "main"
+            self._tick = 42
+
+    info = fly._snapshot_agent_debug(_Wrapper())
+
+    assert info["mode"] == "navigation"
+    assert info["goal_detected"] is True
+    assert info["goal_visible"] is True
+    assert info["goal_tracked"] is True
+    assert info["goal_visibility_prob"] == pytest.approx(0.73)
+    assert info["map_prediction"] == "mountain:0.880"
+    assert info["active_controller"] == "main"
+    assert info["controller_tick"] == 42
+
+
 def test_build_hud_lines_includes_key_fields() -> None:
     from types import SimpleNamespace
 
